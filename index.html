@@ -1,0 +1,131 @@
+﻿<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icons/icon-192.png" sizes="192x192" />
+  <title>Offlinely MVP</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main>
+    <section class="map-wrap">
+      <div id="map" aria-label="Карта"></div>
+
+      <header class="topbar">
+        <div class="search-global">
+          <input id="globalSearchInput" type="text" placeholder="Город, страна, магазин, адрес" autocomplete="off" />
+          <button id="globalSearchBtn" type="button">Найти</button>
+        </div>
+        <span id="networkStatus" class="status"></span>
+      </header>
+
+      <aside id="navCard" class="nav-card hidden">
+        <div class="nav-card-title">Следующий маневр</div>
+        <div id="navCardArrow" class="nav-card-arrow">↑</div>
+        <div id="navCardDistance" class="nav-card-distance">-</div>
+        <div id="navCardText" class="nav-card-text">Маршрут не запущен.</div>
+        <div id="navCardMeta" class="nav-card-meta"></div>
+      </aside>
+
+      <aside id="speedChip" class="speed-chip">0 км/ч</aside>
+
+      <div id="searchResults" class="search-results hidden"></div>
+
+      <aside id="mapContextMenu" class="map-context hidden" aria-hidden="true">
+        <button id="ctxBuildRouteBtn" type="button">Построить маршрут</button>
+        <button id="ctxSetStartBtn" type="button" class="tonal">Отсюда (старт)</button>
+        <button id="ctxSetEndBtn" type="button" class="tonal">Сюда (финиш)</button>
+        <button id="ctxAddFavoriteBtn" type="button" class="tonal">В избранное</button>
+      </aside>
+
+      <aside id="placeActions" class="place-actions hidden" aria-hidden="true">
+        <div id="placeTitle" class="place-title"></div>
+        <div id="placeMeta" class="place-meta"></div>
+        <div class="place-btns">
+          <button id="placeDownloadBtn" type="button">Скачать область</button>
+          <button id="placeRouteBtn" type="button" class="tonal">Построить маршрут</button>
+          <button id="placeCloseBtn" type="button" class="tonal">Закрыть</button>
+        </div>
+      </aside>
+
+      <aside id="sheet" class="sheet closed" aria-hidden="true">
+        <div class="sheet-head">
+          <button id="closeSheetBtn" type="button" class="tonal">Закрыть</button>
+          <div id="sheetTitle" class="sheet-title">Панель</div>
+        </div>
+
+        <section id="downloadPanel" class="panel-block hidden">
+          <div class="panel-row inline">
+            <label for="minZoom">Min</label>
+            <input id="minZoom" type="number" min="0" max="22" value="8" />
+            <label for="maxZoom">Max</label>
+            <input id="maxZoom" type="number" min="0" max="22" value="12" />
+          </div>
+
+          <div class="panel-row">
+            <button id="downloadBtn" type="button" class="wide">Скачать выбранную область</button>
+          </div>
+
+          <div class="panel-row checkbox">
+            <input id="autoCacheToggle" type="checkbox" checked />
+            <label for="autoCacheToggle">Автоскачивание при просмотре карты</label>
+          </div>
+
+          <div class="panel-row small" id="downloadStatus">Инициализация...</div>
+          <div class="panel-row small" id="storageInfo">Проверка хранилища...</div>
+        </section>
+
+        <section id="navPanel" class="panel-block hidden">
+          <div class="panel-row nav-grid">
+            <button id="setStartGpsBtn" type="button">Старт: GPS</button>
+            <button id="setStartMapBtn" type="button" class="tonal">Старт: тап по карте</button>
+            <button id="setEndMapBtn" type="button">Финиш: тап по карте</button>
+            <button id="buildRouteBtn" type="button" class="wide">Построить маршрут</button>
+          </div>
+          <div class="panel-row nav-grid">
+            <button id="startGuidanceBtn" type="button">Начать ведение</button>
+            <button id="stopGuidanceBtn" type="button" class="tonal">Остановить ведение</button>
+          </div>
+          <div class="panel-row">
+            <label for="iconUploadInput">Иконка пользователя (PNG)</label>
+            <input id="iconUploadInput" type="file" accept="image/png,image/webp,image/jpeg" />
+            <button id="resetUserIconBtn" type="button" class="tonal">Сбросить иконку</button>
+          </div>
+          <div class="panel-row inline">
+            <label for="customLat">Lat</label>
+            <input id="customLat" type="number" step="0.000001" />
+            <label for="customLon">Lon</label>
+            <input id="customLon" type="number" step="0.000001" />
+          </div>
+          <div class="panel-row nav-grid">
+            <button id="applyCustomPosBtn" type="button">Применить позицию</button>
+            <button id="clearCustomPosBtn" type="button" class="tonal">GPS обратно</button>
+          </div>
+          <div class="panel-row small" id="routeSummary">Маршрут не построен.</div>
+          <div id="nextStep" class="panel-row next-step">Следующий маневр: -</div>
+          <div id="stepsList" class="steps-list"></div>
+        </section>
+      </aside>
+
+      <div class="dock" role="toolbar" aria-label="Действия карты">
+        <button id="openDownloadBtn" type="button" class="dock-btn">Загрузка</button>
+        <button id="openNavBtn" type="button" class="dock-btn">Навигация</button>
+        <button id="recenterBtn" type="button" class="dock-btn primary">Локация</button>
+      </div>
+    </section>
+
+    <aside class="foot-note">
+      <div class="panel-row tiny">
+        Браузер ограничивает квоту. 10+ GB зависит от устройства и свободного места.
+      </div>
+    </aside>
+  </main>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

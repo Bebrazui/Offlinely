@@ -1,0 +1,12 @@
+{
+  "name": "offlinely",
+  "version": "1.0.0",
+  "description": "MVP оффлайн-векторной карты как PWA с управляемым кэшированием.",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"No build step required for static deployment\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
