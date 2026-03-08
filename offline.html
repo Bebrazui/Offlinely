@@ -1,0 +1,27 @@
+﻿<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>Offlinely • Оффлайн страны</title>
+  <link rel="stylesheet" href="./offline.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="top">
+      <a class="back" href="./index.html">← Карта</a>
+      <h1>Скачивание стран</h1>
+    </header>
+
+    <section class="search-box">
+      <input id="countrySearch" type="text" placeholder="Поиск страны" autocomplete="off" />
+      <div id="storageInfo" class="storage">Проверка хранилища...</div>
+    </section>
+
+    <section id="countryList" class="list"></section>
+  </main>
+
+  <script type="module" src="./offline.js"></script>
+</body>
+</html>

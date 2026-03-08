@@ -100,6 +100,18 @@ self.addEventListener('message', (event) => {
     return;
   }
 
+  if (msg.type === 'DELETE_URLS' && Array.isArray(msg.urls)) {
+    event.waitUntil((async () => {
+      const cache = await caches.open(TILE_CACHE);
+      await Promise.all(
+        msg.urls
+          .filter((u) => typeof u === 'string')
+          .map((u) => cache.delete(new Request(u, { mode: 'cors' })))
+      );
+    })());
+    return;
+  }
+
   if (msg.type === 'GET_SETTINGS') {
     event.waitUntil((async () => {
       const enabled = await getSetting(AUTO_CACHE_KEY, true);

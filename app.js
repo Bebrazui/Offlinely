@@ -3,12 +3,14 @@
 const STATUS_EL = $('networkStatus');
 const RECENTER_BTN = $('recenterBtn');
 const OPEN_DOWNLOAD_BTN = $('openDownloadBtn');
+const OPEN_SETTINGS_BTN = $('openSettingsBtn');
 const OPEN_NAV_BTN = $('openNavBtn');
 const CLOSE_SHEET_BTN = $('closeSheetBtn');
 const SHEET = $('sheet');
 const SHEET_TITLE = $('sheetTitle');
 const DOWNLOAD_PANEL = $('downloadPanel');
 const NAV_PANEL = $('navPanel');
+const SETTINGS_PANEL = $('settingsPanel');
 
 const GLOBAL_SEARCH_INPUT = $('globalSearchInput');
 const GLOBAL_SEARCH_BTN = $('globalSearchBtn');
@@ -33,6 +35,7 @@ const PLACE_CLOSE_BTN = $('placeCloseBtn');
 
 const AUTO_CACHE_TOGGLE = $('autoCacheToggle');
 const DOWNLOAD_BTN = $('downloadBtn');
+const OPEN_OFFLINE_PAGE_BTN = $('openOfflinePageBtn');
 const MIN_ZOOM_INPUT = $('minZoom');
 const MAX_ZOOM_INPUT = $('maxZoom');
 const STORAGE_INFO = $('storageInfo');
@@ -51,8 +54,17 @@ const CUSTOM_LON_INPUT = $('customLon');
 const APPLY_CUSTOM_POS_BTN = $('applyCustomPosBtn');
 const CLEAR_CUSTOM_POS_BTN = $('clearCustomPosBtn');
 const ROUTE_SUMMARY = $('routeSummary');
+const ROUTE_VARIANTS = $('routeVariants');
+const CONTINUE_LAST_ROUTE_BTN = $('continueLastRouteBtn');
+const ROUTE_HISTORY_LIST = $('routeHistoryList');
 const NEXT_STEP = $('nextStep');
 const STEPS_LIST = $('stepsList');
+const PREFER_SERVER_ROUTE_TOGGLE = $('preferServerRouteToggle');
+const AVOID_TOLLS_TOGGLE = $('avoidTollsToggle');
+const AVOID_FERRIES_TOGGLE = $('avoidFerriesToggle');
+const AVOID_CITIES_TOGGLE = $('avoidCitiesToggle');
+const ROUTE_VARIANTS_COUNT = $('routeVariantsCount');
+const REROUTE_THRESHOLD = $('rerouteThreshold');
 
 const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
@@ -70,8 +82,14 @@ let startPoint = null;
 let endPoint = null;
 let routeGeoJson = null;
 let routeSteps = [];
+let routeCandidates = [];
+let activeRouteIndex = 0;
+let routeHistory = [];
 let guidanceWatchId = null;
 let userLocation = null;
+let userHeadingDeg = null;
+let orientationListening = false;
+let etaMinutes = null;
 let manualPositionOverride = null;
 let rerouteInFlight = false;
 let lastRerouteAt = 0;
@@ -89,12 +107,13 @@ const map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-left');
 
 function setSheet(mode) {
-  const opened = mode === 'download' || mode === 'nav';
+  const opened = mode === 'download' || mode === 'nav' || mode === 'settings';
   SHEET.classList.toggle('closed', !opened);
   SHEET.setAttribute('aria-hidden', opened ? 'false' : 'true');
   DOWNLOAD_PANEL.classList.toggle('hidden', mode !== 'download');
   NAV_PANEL.classList.toggle('hidden', mode !== 'nav');
-  SHEET_TITLE.textContent = mode === 'download' ? 'Загрузка оффлайн карт' : mode === 'nav' ? 'Навигатор' : 'Панель';
+  SETTINGS_PANEL.classList.toggle('hidden', mode !== 'settings');
+  SHEET_TITLE.textContent = mode === 'download' ? 'Загрузка оффлайн карт' : mode === 'nav' ? 'Навигатор' : mode === 'settings' ? 'Настройки маршрута' : 'Панель';
 }
 
 function showPlaceActions(place) {
@@ -241,6 +260,26 @@ function formatDuration(sec) {
   return `${h} ч ${m} мин`;
 }
 
+function formatEtaMinutes(mins) {
+  if (!Number.isFinite(mins)) return '-';
+  const m = Math.max(1, Math.round(mins));
+  return `${m} мин`;
+}
+
+function trafficMultiplierByHour(hour) {
+  if ((hour >= 7 && hour <= 10) || (hour >= 17 && hour <= 20)) return 1.45;
+  if (hour >= 11 && hour <= 16) return 1.18;
+  return 1.0;
+}
+
+function estimateEtaWithTraffic(remainingDurationSec, speedKmh) {
+  const h = new Date().getHours();
+  const base = remainingDurationSec / 60;
+  const traffic = trafficMultiplierByHour(h);
+  const speedFactor = speedKmh > 1 ? Math.max(0.85, Math.min(1.55, 50 / speedKmh)) : 1.25;
+  return base * traffic * speedFactor;
+}
+
 function haversineMeters(a, b) {
   const R = 6371000;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -250,6 +289,331 @@ function haversineMeters(a, b) {
   const lat2 = toRad(b[1]);
   const s = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function metersToDegreesLat(m) {
+  return m / 111320;
+}
+
+function metersToDegreesLon(m, lat) {
+  return m / (111320 * Math.cos((lat * Math.PI) / 180));
+}
+
+function coordKey(c) {
+  return `${c[0].toFixed(5)},${c[1].toFixed(5)}`;
+}
+
+function parseLineCoords(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === 'LineString') return [geometry.coordinates];
+  if (geometry.type === 'MultiLineString') return geometry.coordinates;
+  return [];
+}
+
+function getRoadLayerIds() {
+  const layers = map.getStyle()?.layers || [];
+  return layers
+    .filter((l) => l.type === 'line')
+    .map((l) => l.id);
+}
+
+function buildRoadGraphFromRendered() {
+  const roadLayerIds = getRoadLayerIds();
+  const features = roadLayerIds.length ? map.queryRenderedFeatures(undefined, { layers: roadLayerIds }) : [];
+  const nodes = new Map();
+  const adj = new Map();
+
+  function ensureNode(coord) {
+    const key = coordKey(coord);
+    if (!nodes.has(key)) nodes.set(key, [coord[0], coord[1]]);
+    if (!adj.has(key)) adj.set(key, []);
+    return key;
+  }
+
+  for (const f of features) {
+    const p = f.properties || {};
+    const cls = String(p.class || p.type || p.kind || '').toLowerCase();
+    const sourceLayer = String(p['source-layer'] || '').toLowerCase();
+    const keepByHint =
+      /(road|street|motorway|trunk|primary|secondary|tertiary|residential|service)/.test(cls) ||
+      /(road|street|transportation)/.test(sourceLayer) ||
+      !(cls.includes('water') || cls.includes('river') || cls.includes('rail') || cls.includes('boundary'));
+    if (!keepByHint) continue;
+
+    const lines = parseLineCoords(f.geometry);
+    for (const line of lines) {
+      for (let i = 1; i < line.length; i += 1) {
+        const a = line[i - 1];
+        const b = line[i];
+        const ak = ensureNode(a);
+        const bk = ensureNode(b);
+        const w = haversineMeters(a, b);
+        adj.get(ak).push({ to: bk, w });
+        adj.get(bk).push({ to: ak, w });
+      }
+    }
+  }
+  return { nodes, adj };
+}
+
+function nearestGraphNodeKey(nodes, point) {
+  let bestKey = null;
+  let best = Number.POSITIVE_INFINITY;
+  for (const [k, c] of nodes.entries()) {
+    const d = haversineMeters(point, c);
+    if (d < best) {
+      best = d;
+      bestKey = k;
+    }
+  }
+  return { key: bestKey, distance: best };
+}
+
+function shortestPath(graph, startKey, endKey) {
+  const { adj, nodes } = graph;
+  const dist = new Map([[startKey, 0]]);
+  const prev = new Map();
+  const visited = new Set();
+
+  while (true) {
+    let cur = null;
+    let curDist = Number.POSITIVE_INFINITY;
+    for (const [k, d] of dist.entries()) {
+      if (!visited.has(k) && d < curDist) {
+        cur = k;
+        curDist = d;
+      }
+    }
+    if (!cur) break;
+    if (cur === endKey) break;
+    visited.add(cur);
+    for (const e of adj.get(cur) || []) {
+      const nd = curDist + e.w;
+      if (nd < (dist.get(e.to) ?? Number.POSITIVE_INFINITY)) {
+        dist.set(e.to, nd);
+        prev.set(e.to, cur);
+      }
+    }
+  }
+
+  if (!dist.has(endKey)) return null;
+  const pathKeys = [];
+  let p = endKey;
+  while (p) {
+    pathKeys.push(p);
+    p = prev.get(p);
+    if (p === startKey) {
+      pathKeys.push(startKey);
+      break;
+    }
+  }
+  pathKeys.reverse();
+  const coords = pathKeys.map((k) => nodes.get(k));
+  return coords.length >= 2 ? coords : null;
+}
+
+function makeCandidateFromCoords(coords, label = 'Локальный маршрут') {
+  let distance = 0;
+  for (let i = 1; i < coords.length; i += 1) {
+    distance += haversineMeters(coords[i - 1], coords[i]);
+  }
+  const avgSpeedMps = 13.9; // ~50 км/ч
+  const duration = distance / avgSpeedMps;
+
+  const firstStepTarget = coords[Math.min(1, coords.length - 1)];
+  const endStepTarget = coords[coords.length - 1];
+  const steps = [
+    {
+      distance: Math.max(distance * 0.7, 1),
+      duration: Math.max(duration * 0.7, 1),
+      maneuver: {
+        instruction: 'Следуйте по дороге',
+        arrow: '↑',
+        location: firstStepTarget,
+      },
+      roadName: label,
+    },
+    {
+      distance: Math.max(distance * 0.3, 1),
+      duration: Math.max(duration * 0.3, 1),
+      maneuver: {
+        instruction: 'Прибытие в точку назначения',
+        arrow: '▣',
+        location: endStepTarget,
+      },
+      roadName: '',
+    },
+  ];
+
+  return {
+    geometry: { type: 'LineString', coordinates: coords },
+    distance,
+    duration,
+    steps,
+  };
+}
+
+function buildSoftFallbackCoords(start, end) {
+  const midLat = (start[1] + end[1]) / 2;
+  const midLon = (start[0] + end[0]) / 2;
+  const dLon = Math.abs(end[0] - start[0]);
+  const dLat = Math.abs(end[1] - start[1]);
+  if (dLon > dLat) {
+    return [start, [midLon, start[1]], [midLon, end[1]], end];
+  }
+  return [start, [start[0], midLat], [end[0], midLat], end];
+}
+
+function buildLocalRouteCandidates(start, end, variants) {
+  const graph = buildRoadGraphFromRendered();
+  const startNode = nearestGraphNodeKey(graph.nodes, start);
+  const endNode = nearestGraphNodeKey(graph.nodes, end);
+
+  const canUseGraph =
+    graph.nodes.size > 20 &&
+    startNode.key &&
+    endNode.key &&
+    startNode.distance < 1500 &&
+    endNode.distance < 1500;
+
+  if (!canUseGraph) {
+    return [makeCandidateFromCoords(buildSoftFallbackCoords(start, end), 'Упрощенный локальный (мало данных дорог)')];
+  }
+
+  const base = shortestPath(graph, startNode.key, endNode.key);
+  if (!base) return [makeCandidateFromCoords(buildSoftFallbackCoords(start, end), 'Упрощенный локальный (маршрут не найден)')];
+
+  const candidates = [makeCandidateFromCoords(base, 'Маршрут по загруженным дорогам')];
+  for (let i = 1; i < variants; i += 1) {
+    const mid = base[Math.floor((base.length - 1) * (i / (variants + 1)))];
+    const off = [mid[0] + metersToDegreesLon(250 * (i % 2 ? -1 : 1), mid[1]), mid[1] + metersToDegreesLat(220 * (i % 2 ? 1 : -1))];
+    const via = nearestGraphNodeKey(graph.nodes, off);
+    if (!via.key) continue;
+    const p1 = shortestPath(graph, startNode.key, via.key);
+    const p2 = shortestPath(graph, via.key, endNode.key);
+    if (!p1 || !p2) continue;
+    const alt = [...p1.slice(0, -1), ...p2];
+    candidates.push(makeCandidateFromCoords(alt, 'Альтернативный локальный'));
+  }
+  return candidates.slice(0, variants);
+}
+
+async function buildServerRouteCandidates(start, end, settings) {
+  const base = {
+    overview: 'full',
+    geometries: 'geojson',
+    steps: 'true',
+  };
+  const excludes = [];
+  if (settings.avoidTolls) excludes.push('toll');
+  if (settings.avoidFerries) excludes.push('ferry');
+
+  const attempts = [];
+  attempts.push({
+    ...base,
+    alternatives: settings.variants > 1 ? 'true' : 'false',
+    ...(excludes.length ? { exclude: excludes.join(',') } : {}),
+  });
+  attempts.push({
+    ...base,
+    alternatives: settings.variants > 1 ? 'true' : 'false',
+  });
+  attempts.push({
+    ...base,
+    alternatives: 'false',
+  });
+
+  let data = null;
+  let lastError = '';
+  const baseCandidates = [];
+  const seen = new Set();
+
+  function routeFingerprint(r) {
+    const c = r?.geometry?.coordinates || [];
+    if (c.length < 2) return `${Math.round(r.distance || 0)}:${Math.round(r.duration || 0)}`;
+    const a = c[0];
+    const b = c[Math.floor(c.length / 2)];
+    const d = c[c.length - 1];
+    return `${a[0].toFixed(3)},${a[1].toFixed(3)}|${b[0].toFixed(3)},${b[1].toFixed(3)}|${d[0].toFixed(3)},${d[1].toFixed(3)}`;
+  }
+
+  function pushUniqueRoutes(routes) {
+    for (const r of routes || []) {
+      const fp = routeFingerprint(r);
+      if (!seen.has(fp)) {
+        seen.add(fp);
+        baseCandidates.push(r);
+      }
+      if (baseCandidates.length >= settings.variants) break;
+    }
+  }
+  for (const attempt of attempts) {
+    const params = new URLSearchParams(attempt);
+    const url = `https://router.project-osrm.org/route/v1/driving/${start[0]},${start[1]};${end[0]},${end[1]}?${params.toString()}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      lastError = `HTTP ${res.status}`;
+      continue;
+    }
+    const candidate = await res.json();
+    if (candidate?.code === 'Ok' && Array.isArray(candidate.routes) && candidate.routes.length) {
+      data = candidate;
+      pushUniqueRoutes(candidate.routes);
+      break;
+    }
+    lastError = candidate?.message || 'No routes';
+  }
+  if (!data) {
+    ROUTE_SUMMARY.textContent = `Серверный маршрут недоступен (${lastError || 'no route'}).`;
+    return [];
+  }
+
+  // If server returned less than requested, ask server again with a via point to force alternatives.
+  if (baseCandidates.length < settings.variants) {
+    const midLon = (start[0] + end[0]) / 2;
+    const midLat = (start[1] + end[1]) / 2;
+    const viaOffsets = [
+      [metersToDegreesLon(900, midLat), metersToDegreesLat(700)],
+      [-metersToDegreesLon(900, midLat), -metersToDegreesLat(700)],
+      [metersToDegreesLon(1400, midLat), -metersToDegreesLat(900)],
+      [-metersToDegreesLon(1400, midLat), metersToDegreesLat(900)],
+    ];
+    for (const [dx, dy] of viaOffsets) {
+      if (baseCandidates.length >= settings.variants) break;
+      const via = [midLon + dx, midLat + dy];
+      const p = new URLSearchParams({
+        overview: 'full',
+        geometries: 'geojson',
+        steps: 'true',
+        alternatives: 'false',
+      });
+      const viaUrl = `https://router.project-osrm.org/route/v1/driving/${start[0]},${start[1]};${via[0]},${via[1]};${end[0]},${end[1]}?${p.toString()}`;
+      try {
+        const r = await fetch(viaUrl);
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (j?.code === 'Ok' && Array.isArray(j.routes) && j.routes.length) {
+          pushUniqueRoutes(j.routes);
+        }
+      } catch {
+        // ignore and keep trying
+      }
+    }
+  }
+
+  return baseCandidates.slice(0, settings.variants).map((r) => {
+    const steps = (r.legs ?? []).flatMap((leg) => leg.steps ?? []).map((step) => ({
+      distance: step.distance,
+      duration: step.duration,
+      maneuver: {
+        instruction: maneuverText(step.maneuver?.type, step.maneuver?.modifier, step.name || ''),
+        arrow: maneuverArrow(step.maneuver?.type, step.maneuver?.modifier),
+        location: step.maneuver?.location,
+      },
+      roadName: step.name || '',
+    }));
+    return { geometry: r.geometry, distance: r.distance, duration: r.duration, steps };
+  });
 }
 
 async function refreshStorageInfo() {
@@ -550,7 +914,40 @@ function updateUserMarker() {
   if (!current) return;
   const marker = ensureUserMarker();
   applyUserMarkerStyle(marker.getElement());
+  // Keep car icon direction stable in viewport while map rotates with phone.
+  marker.setRotationAlignment('viewport');
+  marker.setRotation(0);
   marker.setLngLat(current);
+}
+
+function extractHeadingFromEvent(e) {
+  if (typeof e.webkitCompassHeading === 'number') return e.webkitCompassHeading;
+  if (typeof e.alpha === 'number') return (360 - e.alpha + 360) % 360;
+  return null;
+}
+
+async function enableOrientationTracking() {
+  if (orientationListening) return;
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const p = await DeviceOrientationEvent.requestPermission();
+      if (p !== 'granted') return;
+    }
+  } catch {
+    // ignore permission failure
+  }
+
+  const handler = (e) => {
+    const heading = extractHeadingFromEvent(e);
+    if (!Number.isFinite(heading)) return;
+    userHeadingDeg = heading;
+    if (guidanceWatchId !== null) {
+      map.easeTo({ bearing: heading, duration: 120 });
+    }
+  };
+  window.addEventListener('deviceorientationabsolute', handler, true);
+  window.addEventListener('deviceorientation', handler, true);
+  orientationListening = true;
 }
 
 function loadFavorites() {
@@ -599,6 +996,112 @@ function saveManualPosition(pos) {
   updateUserMarker();
 }
 
+function loadRouteSettings() {
+  try {
+    const raw = localStorage.getItem('offlinely_route_settings');
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    PREFER_SERVER_ROUTE_TOGGLE.checked = s.preferServerRoute !== false;
+    AVOID_TOLLS_TOGGLE.checked = Boolean(s.avoidTolls);
+    AVOID_FERRIES_TOGGLE.checked = Boolean(s.avoidFerries);
+    AVOID_CITIES_TOGGLE.checked = Boolean(s.avoidCities);
+    ROUTE_VARIANTS_COUNT.value = String(clamp(Number(s.variants) || 3, 1, 3));
+    REROUTE_THRESHOLD.value = String(clamp(Number(s.rerouteThreshold) || 55, 20, 300));
+  } catch {
+    // ignore
+  }
+}
+
+function getRouteSettings() {
+  return {
+    preferServerRoute: PREFER_SERVER_ROUTE_TOGGLE.checked,
+    avoidTolls: AVOID_TOLLS_TOGGLE.checked,
+    avoidFerries: AVOID_FERRIES_TOGGLE.checked,
+    avoidCities: AVOID_CITIES_TOGGLE.checked,
+    variants: clamp(Number(ROUTE_VARIANTS_COUNT.value) || 3, 1, 3),
+    rerouteThreshold: clamp(Number(REROUTE_THRESHOLD.value) || 55, 20, 300),
+  };
+}
+
+function saveRouteSettings() {
+  localStorage.setItem('offlinely_route_settings', JSON.stringify(getRouteSettings()));
+}
+
+function loadRouteHistory() {
+  try {
+    const raw = localStorage.getItem('offlinely_route_history');
+    const parsed = raw ? JSON.parse(raw) : [];
+    routeHistory = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    routeHistory = [];
+  }
+}
+
+function saveRouteHistory() {
+  localStorage.setItem('offlinely_route_history', JSON.stringify(routeHistory.slice(0, 20)));
+}
+
+function renderRouteHistory() {
+  ROUTE_HISTORY_LIST.innerHTML = '';
+  routeHistory.slice(0, 8).forEach((h) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'variant-btn tonal';
+    b.textContent = `${new Date(h.ts).toLocaleString()} • ${formatDistance(h.distance)}`;
+    b.addEventListener('click', () => {
+      routeCandidates = [h.route];
+      applyRouteCandidate(0);
+      setSheet('nav');
+      ROUTE_SUMMARY.textContent = `История: ${formatDistance(h.distance)}, ${formatDuration(h.duration)}.`;
+    });
+    ROUTE_HISTORY_LIST.appendChild(b);
+  });
+}
+
+function saveCurrentRouteToHistory(sourceLabel) {
+  if (!routeCandidates.length) return;
+  const r = routeCandidates[activeRouteIndex] || routeCandidates[0];
+  routeHistory.unshift({
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    ts: Date.now(),
+    source: sourceLabel,
+    distance: r.distance,
+    duration: r.duration,
+    route: r,
+  });
+  routeHistory = routeHistory.slice(0, 20);
+  saveRouteHistory();
+  renderRouteHistory();
+}
+
+function findBestHistoryRouteFor(start, end) {
+  if (!routeHistory.length) return null;
+  let best = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const h of routeHistory) {
+    const coords = h?.route?.geometry?.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) continue;
+    const histStart = coords[0];
+    const histEnd = coords[coords.length - 1];
+    const startErr = haversineMeters(start, histStart);
+    const endErr = haversineMeters(end, histEnd);
+    const score = endErr * 2 + startErr;
+    if (score < bestScore) {
+      bestScore = score;
+      best = h.route;
+    }
+  }
+
+  // Требуем близкое совпадение старта и финиша
+  if (!best) return null;
+  const bestStart = best.geometry.coordinates[0];
+  const bestEnd = best.geometry.coordinates[best.geometry.coordinates.length - 1];
+  if (haversineMeters(start, bestStart) > 3000) return null;
+  if (haversineMeters(end, bestEnd) > 3000) return null;
+  return best;
+}
+
 function saveFavorites() {
   localStorage.setItem('offlinely_favorites', JSON.stringify(favorites));
 }
@@ -626,50 +1129,15 @@ function renderSteps(activeIndex = -1) {
   });
 }
 
-async function buildRoute() {
-  if (!startPoint || !endPoint) {
-    ROUTE_SUMMARY.textContent = 'Укажи старт и финиш.';
-    return;
-  }
-  if (!navigator.onLine) {
-    ROUTE_SUMMARY.textContent = 'Для построения маршрута нужен интернет.';
-    return;
-  }
-
-  const url = `https://router.project-osrm.org/route/v1/driving/${startPoint[0]},${startPoint[1]};${endPoint[0]},${endPoint[1]}?overview=full&geometries=geojson&steps=true`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    ROUTE_SUMMARY.textContent = 'Маршрут не построен (ошибка сервера).';
-    return;
-  }
-
-  const data = await res.json();
-  const route = data?.routes?.[0];
-  if (!route) {
-    ROUTE_SUMMARY.textContent = 'Маршрут не найден.';
-    return;
-  }
-
-  routeGeoJson = route.geometry;
-  routeSteps = (route.legs ?? []).flatMap((leg) => leg.steps ?? []).map((step) => ({
-    distance: step.distance,
-    duration: step.duration,
-    maneuver: {
-      instruction: maneuverText(step.maneuver?.type, step.maneuver?.modifier, step.name || ''),
-      arrow: maneuverArrow(step.maneuver?.type, step.maneuver?.modifier),
-      location: step.maneuver?.location,
-    },
-    roadName: step.name || '',
-  }));
-
+function applyRouteCandidate(index) {
+  if (!routeCandidates.length) return;
+  activeRouteIndex = clamp(index, 0, routeCandidates.length - 1);
+  const selected = routeCandidates[activeRouteIndex];
+  routeGeoJson = selected.geometry;
+  routeSteps = selected.steps;
   updateRouteLayer();
   renderSteps();
-
-  const coords = route.geometry.coordinates;
-  const bounds = coords.reduce((b, c) => b.extend(c), new maplibregl.LngLatBounds(coords[0], coords[0]));
-  map.fitBounds(bounds, { padding: 40, duration: 700 });
-
-  ROUTE_SUMMARY.textContent = `Маршрут: ${formatDistance(route.distance)}, ${formatDuration(route.duration)}.`;
+  ROUTE_SUMMARY.textContent = `Локальный маршрут ${activeRouteIndex + 1}: ${formatDistance(selected.distance)}, ${formatDuration(selected.duration)}.`;
   NEXT_STEP.textContent = routeSteps.length ? `Следующий маневр: ${routeSteps[0].maneuver.instruction}` : 'Следующий маневр: -';
   showNavCard(
     routeSteps.length ? formatDistance(routeSteps[0].distance) : '-',
@@ -677,6 +1145,66 @@ async function buildRoute() {
     routeSteps.length ? (routeSteps[0].roadName || 'Держись маршрута') : '',
     routeSteps.length ? routeSteps[0].maneuver.arrow : '↑'
   );
+
+  ROUTE_VARIANTS.innerHTML = '';
+  routeCandidates.forEach((r, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `variant-btn tonal${i === activeRouteIndex ? ' active' : ''}`;
+    b.textContent = `${i + 1}: ${formatDuration(r.duration)}`;
+    b.addEventListener('click', () => applyRouteCandidate(i));
+    ROUTE_VARIANTS.appendChild(b);
+  });
+}
+
+async function buildRoute() {
+  if (!startPoint || !endPoint) {
+    ROUTE_SUMMARY.textContent = 'Укажи старт и финиш.';
+    return;
+  }
+  const settings = getRouteSettings();
+  routeCandidates = [];
+  let sourceLabel = 'history';
+  if (!navigator.onLine) {
+    const fromHistory = findBestHistoryRouteFor(startPoint, endPoint);
+    if (!fromHistory) {
+      ROUTE_SUMMARY.textContent = 'Оффлайн-маршрут недоступен: сначала построй этот маршрут онлайн.';
+      return;
+    }
+    routeCandidates = [fromHistory];
+    sourceLabel = 'history';
+  } else if (settings.preferServerRoute) {
+    try {
+      routeCandidates = await buildServerRouteCandidates(startPoint, endPoint, settings);
+      sourceLabel = 'server';
+    } catch {
+      routeCandidates = [];
+    }
+  }
+  if (!routeCandidates.length && navigator.onLine && !settings.preferServerRoute) {
+    routeCandidates = buildLocalRouteCandidates(startPoint, endPoint, settings.variants);
+    sourceLabel = 'local';
+  }
+  if (!routeCandidates.length && navigator.onLine) {
+    const fromHistory = findBestHistoryRouteFor(startPoint, endPoint);
+    if (fromHistory) {
+      routeCandidates = [fromHistory];
+      sourceLabel = 'history';
+    }
+  }
+  if (!routeCandidates.length) {
+    ROUTE_SUMMARY.textContent = 'Серверный маршрут не получен. Попробуй еще раз онлайн или используй историю.';
+    return;
+  }
+  if (settings.avoidCities || settings.avoidTolls || settings.avoidFerries) {
+    routeCandidates.sort((a, b) => (a.steps.length * 14 + a.duration) - (b.steps.length * 14 + b.duration));
+  }
+  applyRouteCandidate(0);
+  saveCurrentRouteToHistory(sourceLabel);
+
+  const coords = routeCandidates[0].geometry.coordinates;
+  const bounds = coords.reduce((b, c) => b.extend(c), new maplibregl.LngLatBounds(coords[0], coords[0]));
+  map.fitBounds(bounds, { padding: 40, duration: 700 });
 }
 
 function findClosestStepIndex(lngLat) {
@@ -705,6 +1233,7 @@ function startGuidance() {
     return;
   }
   if (guidanceWatchId !== null) return;
+  enableOrientationTracking();
 
   guidanceWatchId = navigator.geolocation.watchPosition(
     async (pos) => {
@@ -719,9 +1248,18 @@ function startGuidance() {
       if (idx >= 0) {
         const step = routeSteps[idx];
         const dist = haversineMeters(current, step.maneuver.location);
+        const remainingDurationSec = routeSteps.slice(idx).reduce((s, st) => s + (st.duration || 0), 0);
         NEXT_STEP.textContent = `Следующий маневр: ${step.maneuver.instruction} через ${formatDistance(dist)}`;
         renderSteps(idx);
-        showNavCard(formatDistance(dist), step.maneuver.instruction, step.roadName || 'Следуй указанию', step.maneuver.arrow);
+        const speedKmh = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed * 3.6) : 0;
+        etaMinutes = estimateEtaWithTraffic(remainingDurationSec, speedKmh);
+        ROUTE_SUMMARY.textContent = `Навигация: ETA ${formatEtaMinutes(etaMinutes)} (с учетом пробок).`;
+        showNavCard(
+          formatDistance(dist),
+          step.maneuver.instruction,
+          `ETA: ${formatEtaMinutes(etaMinutes)} • ${step.roadName || 'Следуй указанию'}`,
+          step.maneuver.arrow
+        );
       }
 
       const speedKmh = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed * 3.6) : 0;
@@ -729,7 +1267,8 @@ function startGuidance() {
 
       const offRouteDistance = nearestRouteDistanceMeters(current, routeGeoJson?.coordinates);
       const rerouteCooldownMs = 12000;
-      if (offRouteDistance > 55 && !rerouteInFlight && Date.now() - lastRerouteAt > rerouteCooldownMs) {
+      const settings = getRouteSettings();
+      if (offRouteDistance > settings.rerouteThreshold && !rerouteInFlight && Date.now() - lastRerouteAt > rerouteCooldownMs) {
         rerouteInFlight = true;
         lastRerouteAt = Date.now();
         startPoint = [...current];
@@ -758,6 +1297,7 @@ function stopGuidance() {
   }
   NEXT_STEP.textContent = 'Следующий маневр: -';
   ROUTE_SUMMARY.textContent = 'Ведение остановлено.';
+  etaMinutes = null;
   hideNavCard();
 }
 
@@ -800,6 +1340,10 @@ function ensureStartFallbackFromMap() {
 
 function setupEvents() {
   OPEN_DOWNLOAD_BTN.addEventListener('click', () => setSheet('download'));
+  OPEN_OFFLINE_PAGE_BTN.addEventListener('click', () => {
+    window.location.href = './offline.html';
+  });
+  OPEN_SETTINGS_BTN.addEventListener('click', () => setSheet('settings'));
   OPEN_NAV_BTN.addEventListener('click', () => setSheet('nav'));
   CLOSE_SHEET_BTN.addEventListener('click', () => setSheet(null));
 
@@ -867,6 +1411,23 @@ function setupEvents() {
 
   DOWNLOAD_BTN.addEventListener('click', () => preloadSelectedArea());
   AUTO_CACHE_TOGGLE.addEventListener('change', () => postToSw({ type: 'SET_AUTO_CACHE', enabled: AUTO_CACHE_TOGGLE.checked }));
+  AVOID_TOLLS_TOGGLE.addEventListener('change', saveRouteSettings);
+  AVOID_FERRIES_TOGGLE.addEventListener('change', saveRouteSettings);
+  AVOID_CITIES_TOGGLE.addEventListener('change', saveRouteSettings);
+  PREFER_SERVER_ROUTE_TOGGLE.addEventListener('change', saveRouteSettings);
+  ROUTE_VARIANTS_COUNT.addEventListener('change', saveRouteSettings);
+  REROUTE_THRESHOLD.addEventListener('change', saveRouteSettings);
+  CONTINUE_LAST_ROUTE_BTN.addEventListener('click', () => {
+    if (!routeHistory.length) {
+      ROUTE_SUMMARY.textContent = 'История пуста.';
+      return;
+    }
+    const h = routeHistory[0];
+    routeCandidates = [h.route];
+    applyRouteCandidate(0);
+    setSheet('nav');
+    ROUTE_SUMMARY.textContent = `Продолжен маршрут из истории: ${formatDistance(h.distance)}.`;
+  });
 
   SET_START_GPS_BTN.addEventListener('click', () => {
     ensureStartByGps().then((ok) => {
@@ -1050,6 +1611,8 @@ async function init() {
   hideNavCard();
   loadFavorites();
   loadUserSettings();
+  loadRouteSettings();
+  loadRouteHistory();
   updateNetworkStatus();
   setupEvents();
   setupServiceWorker();
@@ -1061,6 +1624,7 @@ async function init() {
     updateFavoritesLayer();
     updateUserLayer();
     updateUserMarker();
+    renderRouteHistory();
     sourceTileTemplates = await resolveVectorTileTemplates();
     DOWNLOAD_STATUS.textContent = sourceTileTemplates.length ? 'Готово к загрузке области.' : 'Не найдены шаблоны векторных тайлов.';
   });

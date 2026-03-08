@@ -59,6 +59,9 @@
         </div>
 
         <section id="downloadPanel" class="panel-block hidden">
+          <div class="panel-row">
+            <button id="openOfflinePageBtn" type="button" class="tonal wide">Страница скачивания стран</button>
+          </div>
           <div class="panel-row inline">
             <label for="minZoom">Min</label>
             <input id="minZoom" type="number" min="0" max="22" value="8" />
@@ -106,13 +109,45 @@
             <button id="clearCustomPosBtn" type="button" class="tonal">GPS обратно</button>
           </div>
           <div class="panel-row small" id="routeSummary">Маршрут не построен.</div>
+          <div id="routeVariants" class="route-variants"></div>
+          <div class="panel-row">
+            <button id="continueLastRouteBtn" type="button" class="tonal">Продолжить последний маршрут</button>
+          </div>
+          <div id="routeHistoryList" class="steps-list"></div>
           <div id="nextStep" class="panel-row next-step">Следующий маневр: -</div>
           <div id="stepsList" class="steps-list"></div>
+        </section>
+
+        <section id="settingsPanel" class="panel-block hidden">
+          <div class="panel-row checkbox">
+            <input id="preferServerRouteToggle" type="checkbox" checked />
+            <label for="preferServerRouteToggle">Предпочитать серверный маршрут (если есть интернет)</label>
+          </div>
+          <div class="panel-row checkbox">
+            <input id="avoidTollsToggle" type="checkbox" />
+            <label for="avoidTollsToggle">Не ехать по платным дорогам</label>
+          </div>
+          <div class="panel-row checkbox">
+            <input id="avoidFerriesToggle" type="checkbox" />
+            <label for="avoidFerriesToggle">Избегать паромов</label>
+          </div>
+          <div class="panel-row checkbox">
+            <input id="avoidCitiesToggle" type="checkbox" />
+            <label for="avoidCitiesToggle">Стараться объезжать города</label>
+          </div>
+          <div class="panel-row inline">
+            <label for="routeVariantsCount">Вариантов</label>
+            <input id="routeVariantsCount" type="number" min="1" max="3" value="3" />
+            <label for="rerouteThreshold">Сход с пути (м)</label>
+            <input id="rerouteThreshold" type="number" min="20" max="300" value="55" />
+          </div>
+          <div class="panel-row small">Настройки применяются при следующем построении/перестроении маршрута.</div>
         </section>
       </aside>
 
       <div class="dock" role="toolbar" aria-label="Действия карты">
-        <button id="openDownloadBtn" type="button" class="dock-btn">Загрузка</button>
+        <button id="openDownloadBtn" type="button" class="dock-btn">Оффлайн</button>
+        <button id="openSettingsBtn" type="button" class="dock-btn">Настройки</button>
         <button id="openNavBtn" type="button" class="dock-btn">Навигация</button>
         <button id="recenterBtn" type="button" class="dock-btn primary">Локация</button>
       </div>
