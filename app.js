@@ -13,7 +13,6 @@ const NAV_PANEL = $('navPanel');
 const SETTINGS_PANEL = $('settingsPanel');
 
 const GLOBAL_SEARCH_INPUT = $('globalSearchInput');
-const GLOBAL_SEARCH_BTN = $('globalSearchBtn');
 const SEARCH_RESULTS = $('searchResults');
 const MAP_CONTEXT_MENU = $('mapContextMenu');
 const CTX_BUILD_ROUTE_BTN = $('ctxBuildRouteBtn');
@@ -60,6 +59,14 @@ const ROUTE_HISTORY_LIST = $('routeHistoryList');
 const NEXT_STEP = $('nextStep');
 const STEPS_LIST = $('stepsList');
 const PREFER_SERVER_ROUTE_TOGGLE = $('preferServerRouteToggle');
+const THEME_SELECT = $('themeSelect');
+const VOICE_ENABLED_TOGGLE = $('voiceEnabledToggle');
+const VOICE_RATE = $('voiceRate');
+const VOICE_VOLUME = $('voiceVolume');
+const VOICE_SELECT = $('voiceSelect');
+const VOICE_TEST_BTN = $('voiceTestBtn');
+const VOICE_PACK_BTN = $('voicePackBtn');
+const VOICE_PACK_STATUS = $('voicePackStatus');
 const AVOID_TOLLS_TOGGLE = $('avoidTollsToggle');
 const AVOID_FERRIES_TOGGLE = $('avoidFerriesToggle');
 const AVOID_CITIES_TOGGLE = $('avoidCitiesToggle');
@@ -67,6 +74,7 @@ const ROUTE_VARIANTS_COUNT = $('routeVariantsCount');
 const REROUTE_THRESHOLD = $('rerouteThreshold');
 
 const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
+const THEME_KEY = 'offlinely_theme';
 
 let selectedPlace = null;
 let currentSearchResults = [];
@@ -88,6 +96,10 @@ let routeHistory = [];
 let guidanceWatchId = null;
 let userLocation = null;
 let userHeadingDeg = null;
+let gpsFix = null;
+let smoothLocation = null;
+let trackingRaf = null;
+let lastFrameTs = 0;
 let orientationListening = false;
 let etaMinutes = null;
 let manualPositionOverride = null;
@@ -95,6 +107,12 @@ let rerouteInFlight = false;
 let lastRerouteAt = 0;
 let userIconDataUrl = null;
 let userMarker = null;
+let spokenStepMarks = new Set();
+let lastSpokenStepIdx = -1;
+let speechVoices = [];
+const VOICE_KEY = 'offlinely_voice';
+const VOICE_PACK_KEY = 'offlinely_voice_pack_ready_at';
+const ACTIVE_TRIP_KEY = 'offlinely_active_trip';
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -289,6 +307,72 @@ function haversineMeters(a, b) {
   const lat2 = toRad(b[1]);
   const s = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function toLocalMeters(coord, refLat) {
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos((refLat * Math.PI) / 180);
+  return [coord[0] * mPerDegLon, coord[1] * mPerDegLat];
+}
+
+function fromLocalMeters(xy, refLat) {
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos((refLat * Math.PI) / 180);
+  return [xy[0] / mPerDegLon, xy[1] / mPerDegLat];
+}
+
+function projectPointToSegment(p, a, b) {
+  const refLat = (a[1] + b[1]) / 2;
+  const pp = toLocalMeters(p, refLat);
+  const aa = toLocalMeters(a, refLat);
+  const bb = toLocalMeters(b, refLat);
+  const abx = bb[0] - aa[0];
+  const aby = bb[1] - aa[1];
+  const apx = pp[0] - aa[0];
+  const apy = pp[1] - aa[1];
+  const denom = abx * abx + aby * aby || 1;
+  const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / denom));
+  const proj = [aa[0] + abx * t, aa[1] + aby * t];
+  const dx = pp[0] - proj[0];
+  const dy = pp[1] - proj[1];
+  return {
+    point: fromLocalMeters(proj, refLat),
+    dist: Math.hypot(dx, dy),
+    t,
+  };
+}
+
+function snapToRoute(point, coords) {
+  if (!coords || coords.length < 2) return { point, dist: Number.POSITIVE_INFINITY, segment: -1 };
+  let best = { point, dist: Number.POSITIVE_INFINITY, segment: -1, t: 0 };
+  for (let i = 1; i < coords.length; i += 1) {
+    const proj = projectPointToSegment(point, coords[i - 1], coords[i]);
+    if (proj.dist < best.dist) {
+      best = { point: proj.point, dist: proj.dist, segment: i - 1, t: proj.t };
+    }
+  }
+  return best;
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpCoord(a, b, t) {
+  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+}
+
+function projectLonLat(coord, bearingDeg, meters) {
+  const R = 6378137;
+  const brng = (bearingDeg * Math.PI) / 180;
+  const lat1 = (coord[1] * Math.PI) / 180;
+  const lon1 = (coord[0] * Math.PI) / 180;
+  const d = meters / R;
+
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brng));
+  const lon2 = lon1 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
+
+  return [(lon2 * 180) / Math.PI, (lat2 * 180) / Math.PI];
 }
 
 function metersToDegreesLat(m) {
@@ -950,6 +1034,89 @@ async function enableOrientationTracking() {
   orientationListening = true;
 }
 
+function stopTrackingLoop() {
+  if (trackingRaf !== null) {
+    cancelAnimationFrame(trackingRaf);
+    trackingRaf = null;
+  }
+  lastFrameTs = 0;
+}
+
+function navigationFrame(ts) {
+  if (guidanceWatchId === null) {
+    stopTrackingLoop();
+    return;
+  }
+
+  const current = getCurrentUserLocation();
+  if (!current) {
+    trackingRaf = requestAnimationFrame(navigationFrame);
+    return;
+  }
+
+  if (!lastFrameTs) lastFrameTs = ts;
+  const dtSec = Math.max(0.001, Math.min((ts - lastFrameTs) / 1000, 0.2));
+  lastFrameTs = ts;
+
+  let predicted = current;
+  if (gpsFix && Number.isFinite(gpsFix.speedMps) && gpsFix.speedMps > 0.4) {
+    const heading = Number.isFinite(gpsFix.headingDeg) ? gpsFix.headingDeg : (Number.isFinite(userHeadingDeg) ? userHeadingDeg : 0);
+    predicted = projectLonLat(current, heading, gpsFix.speedMps * dtSec);
+  }
+
+  smoothLocation = smoothLocation ? lerpCoord(smoothLocation, predicted, 0.55) : predicted;
+  const snapped = snapToRoute(smoothLocation, routeGeoJson?.coordinates);
+  const navPosition = snapped.dist < 80 ? snapped.point : smoothLocation;
+  if (!manualPositionOverride) userLocation = snapped.dist < 80 ? navPosition : smoothLocation;
+  updateUserLayer();
+  updateUserMarker();
+
+  const idx = findClosestStepIndex(navPosition);
+  if (idx >= 0) {
+    const step = routeSteps[idx];
+    const dist = haversineMeters(navPosition, step.maneuver.location);
+    const remainingDurationSec = routeSteps.slice(idx).reduce((s, st) => s + (st.duration || 0), 0);
+    renderSteps(idx);
+    const speedKmh = Number.isFinite(gpsFix?.speedMps) ? Math.max(0, gpsFix.speedMps * 3.6) : 0;
+    etaMinutes = estimateEtaWithTraffic(remainingDurationSec, speedKmh);
+    ROUTE_SUMMARY.textContent = `Навигация: ETA ${formatEtaMinutes(etaMinutes)} (с учетом пробок).`;
+    NEXT_STEP.textContent = `Следующий маневр: ${step.maneuver.instruction} через ${formatDistance(dist)}`;
+    showNavCard(
+      formatDistance(dist),
+      step.maneuver.instruction,
+      `ETA: ${formatEtaMinutes(etaMinutes)} • ${step.roadName || 'Следуй указанию'}`,
+      step.maneuver.arrow
+    );
+    maybeSpeakManeuver(idx, dist, step.maneuver.instruction);
+  }
+
+  const offRouteDistance = nearestRouteDistanceMeters(navPosition, routeGeoJson?.coordinates);
+  const rerouteCooldownMs = 12000;
+  const settings = getRouteSettings();
+  if (offRouteDistance > settings.rerouteThreshold && !rerouteInFlight && Date.now() - lastRerouteAt > rerouteCooldownMs) {
+    rerouteInFlight = true;
+    lastRerouteAt = Date.now();
+    startPoint = [...navPosition];
+    ROUTE_SUMMARY.textContent = 'Перестраиваю маршрут...';
+    buildRoute().finally(() => {
+      rerouteInFlight = false;
+    });
+  }
+
+  map.jumpTo({
+    center: navPosition,
+    zoom: Math.max(map.getZoom(), 14),
+    bearing: Number.isFinite(userHeadingDeg) ? userHeadingDeg : map.getBearing(),
+  });
+
+  trackingRaf = requestAnimationFrame(navigationFrame);
+}
+
+function startTrackingLoop() {
+  if (trackingRaf !== null) return;
+  trackingRaf = requestAnimationFrame(navigationFrame);
+}
+
 function loadFavorites() {
   try {
     const raw = localStorage.getItem('offlinely_favorites');
@@ -1027,6 +1194,180 @@ function saveRouteSettings() {
   localStorage.setItem('offlinely_route_settings', JSON.stringify(getRouteSettings()));
 }
 
+function applyTheme(mode) {
+  if (mode === 'system') {
+    document.documentElement.removeAttribute('data-theme');
+    return;
+  }
+  document.documentElement.setAttribute('data-theme', mode);
+}
+
+function loadTheme() {
+  const saved = localStorage.getItem(THEME_KEY) || 'system';
+  THEME_SELECT.value = saved;
+  applyTheme(saved);
+}
+
+function getVoiceSettings() {
+  return {
+    enabled: VOICE_ENABLED_TOGGLE.checked,
+    rate: clamp(Number(VOICE_RATE.value) || 1, 0.7, 1.3),
+    volume: clamp(Number(VOICE_VOLUME.value) || 1, 0.2, 1),
+    voiceURI: VOICE_SELECT.value || '',
+  };
+}
+
+function saveVoiceSettings() {
+  localStorage.setItem(VOICE_KEY, JSON.stringify(getVoiceSettings()));
+}
+
+function loadVoiceSettings() {
+  try {
+    const raw = localStorage.getItem(VOICE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    if (!v) return;
+    VOICE_ENABLED_TOGGLE.checked = v.enabled !== false;
+    VOICE_RATE.value = String(clamp(Number(v.rate) || 1, 0.7, 1.3));
+    VOICE_VOLUME.value = String(clamp(Number(v.volume) || 1, 0.2, 1));
+  } catch {
+    // ignore
+  }
+}
+
+function pickDefaultVoice(voices) {
+  return (
+    voices.find((v) => v.localService && /^ru/i.test(v.lang)) ||
+    voices.find((v) => /^ru/i.test(v.lang)) ||
+    voices.find((v) => v.localService) ||
+    voices[0] ||
+    null
+  );
+}
+
+function refreshVoiceList() {
+  if (!('speechSynthesis' in window)) return;
+  speechVoices = window.speechSynthesis.getVoices();
+  VOICE_SELECT.innerHTML = '';
+  speechVoices.forEach((v) => {
+    const opt = document.createElement('option');
+    opt.value = v.voiceURI;
+    opt.textContent = `${v.name} (${v.lang})${v.localService ? ' • offline' : ''}`;
+    VOICE_SELECT.appendChild(opt);
+  });
+  const settings = (() => {
+    try { return JSON.parse(localStorage.getItem(VOICE_KEY) || '{}'); } catch { return {}; }
+  })();
+  const defaultVoice = settings.voiceURI || pickDefaultVoice(speechVoices)?.voiceURI || '';
+  if (defaultVoice) VOICE_SELECT.value = defaultVoice;
+}
+
+function speak(text, priority = false) {
+  const s = getVoiceSettings();
+  if (!s.enabled || !('speechSynthesis' in window) || !text) return;
+  const u = new SpeechSynthesisUtterance(text);
+  const voice = speechVoices.find((v) => v.voiceURI === s.voiceURI) || pickDefaultVoice(speechVoices);
+  if (voice) u.voice = voice;
+  u.lang = (voice && voice.lang) || 'ru-RU';
+  u.rate = s.rate;
+  u.volume = s.volume;
+  if (priority) window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(u);
+}
+
+function speakAsync(text, volumeOverride = null) {
+  return new Promise((resolve) => {
+    const s = getVoiceSettings();
+    if (!s.enabled || !('speechSynthesis' in window) || !text) {
+      resolve();
+      return;
+    }
+    const u = new SpeechSynthesisUtterance(text);
+    const voice = speechVoices.find((v) => v.voiceURI === s.voiceURI) || pickDefaultVoice(speechVoices);
+    if (voice) u.voice = voice;
+    u.lang = (voice && voice.lang) || 'ru-RU';
+    u.rate = s.rate;
+    u.volume = volumeOverride === null ? s.volume : volumeOverride;
+    u.onend = () => resolve();
+    u.onerror = () => resolve();
+    window.speechSynthesis.speak(u);
+  });
+}
+
+function normalizeDistanceBucket(distMeters) {
+  const buckets = [50, 70, 100, 150, 200, 300, 400, 500, 700, 800, 1000];
+  let best = buckets[0];
+  let err = Math.abs(distMeters - best);
+  for (const b of buckets) {
+    const e = Math.abs(distMeters - b);
+    if (e < err) {
+      err = e;
+      best = b;
+    }
+  }
+  return best;
+}
+
+function instructionChunk(instruction) {
+  const t = (instruction || '').toLowerCase();
+  if (t.includes('налево')) return 'поверните налево';
+  if (t.includes('направо')) return 'поверните направо';
+  if (t.includes('развер')) return 'выполните разворот';
+  if (t.includes('круг')) return 'на круговом движении выберите съезд';
+  if (t.includes('держитесь лев')) return 'держитесь левее';
+  if (t.includes('держитесь прав')) return 'держитесь правее';
+  if (t.includes('прибыт')) return 'пункт назначения впереди';
+  return 'двигайтесь прямо';
+}
+
+function composeManeuverPhrase(distMeters, instruction) {
+  const d = normalizeDistanceBucket(distMeters);
+  return `Через ${d} метров ${instructionChunk(instruction)}.`;
+}
+
+async function warmupVoicePack() {
+  if (!('speechSynthesis' in window)) {
+    VOICE_PACK_STATUS.textContent = 'TTS недоступен в этом браузере.';
+    return;
+  }
+  const phrases = [
+    'Через 50 метров поверните направо.',
+    'Через 100 метров поверните налево.',
+    'Через 200 метров держитесь правее.',
+    'Через 300 метров держитесь левее.',
+    'Через 500 метров выполните разворот.',
+    'Через 800 метров на круговом движении выберите съезд.',
+    'Пункт назначения впереди.',
+  ];
+
+  VOICE_PACK_BTN.disabled = true;
+  VOICE_PACK_STATUS.textContent = 'Подготовка голосового пакета...';
+  window.speechSynthesis.cancel();
+  for (let i = 0; i < phrases.length; i += 1) {
+    VOICE_PACK_STATUS.textContent = `Подготовка фраз: ${i + 1}/${phrases.length}`;
+    // Very low volume warmup to initialize local TTS internals.
+    // Browser does not allow exporting built voice audio chunks.
+    await speakAsync(phrases[i], 0.01);
+  }
+  localStorage.setItem(VOICE_PACK_KEY, String(Date.now()));
+  VOICE_PACK_STATUS.textContent = 'Голосовой пакет подготовлен для оффлайн-подсказок.';
+  VOICE_PACK_BTN.disabled = false;
+}
+
+function maybeSpeakManeuver(stepIdx, distMeters, instruction) {
+  const marks = [800, 500, 300, 150, 70];
+  if (stepIdx !== lastSpokenStepIdx) {
+    lastSpokenStepIdx = stepIdx;
+  }
+  for (const m of marks) {
+    const key = `${stepIdx}:${m}`;
+    if (distMeters <= m && !spokenStepMarks.has(key)) {
+      spokenStepMarks.add(key);
+      speak(composeManeuverPhrase(m, instruction));
+      break;
+    }
+  }
+}
+
 function loadRouteHistory() {
   try {
     const raw = localStorage.getItem('offlinely_route_history');
@@ -1072,6 +1413,38 @@ function saveCurrentRouteToHistory(sourceLabel) {
   routeHistory = routeHistory.slice(0, 20);
   saveRouteHistory();
   renderRouteHistory();
+}
+
+function saveActiveTrip() {
+  try {
+    if (!routeCandidates.length || !startPoint || !endPoint) {
+      localStorage.removeItem(ACTIVE_TRIP_KEY);
+      return;
+    }
+    const payload = {
+      ts: Date.now(),
+      startPoint,
+      endPoint,
+      activeRouteIndex,
+      routeCandidates,
+      guidanceActive: guidanceWatchId !== null,
+    };
+    localStorage.setItem(ACTIVE_TRIP_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore
+  }
+}
+
+function loadActiveTrip() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_TRIP_KEY);
+    if (!raw) return null;
+    const t = JSON.parse(raw);
+    if (!t || !Array.isArray(t.routeCandidates) || !t.routeCandidates.length) return null;
+    return t;
+  } catch {
+    return null;
+  }
 }
 
 function findBestHistoryRouteFor(start, end) {
@@ -1135,6 +1508,8 @@ function applyRouteCandidate(index) {
   const selected = routeCandidates[activeRouteIndex];
   routeGeoJson = selected.geometry;
   routeSteps = selected.steps;
+  spokenStepMarks = new Set();
+  lastSpokenStepIdx = -1;
   updateRouteLayer();
   renderSteps();
   ROUTE_SUMMARY.textContent = `Локальный маршрут ${activeRouteIndex + 1}: ${formatDistance(selected.distance)}, ${formatDuration(selected.duration)}.`;
@@ -1155,6 +1530,7 @@ function applyRouteCandidate(index) {
     b.addEventListener('click', () => applyRouteCandidate(i));
     ROUTE_VARIANTS.appendChild(b);
   });
+  saveActiveTrip();
 }
 
 async function buildRoute() {
@@ -1234,60 +1610,30 @@ function startGuidance() {
   }
   if (guidanceWatchId !== null) return;
   enableOrientationTracking();
+  speak('Навигация запущена.', true);
 
   guidanceWatchId = navigator.geolocation.watchPosition(
     async (pos) => {
       if (!manualPositionOverride) {
         userLocation = [pos.coords.longitude, pos.coords.latitude];
       }
-      updateUserLayer();
-      updateUserMarker();
-
-      const current = getCurrentUserLocation();
-      const idx = findClosestStepIndex(current);
-      if (idx >= 0) {
-        const step = routeSteps[idx];
-        const dist = haversineMeters(current, step.maneuver.location);
-        const remainingDurationSec = routeSteps.slice(idx).reduce((s, st) => s + (st.duration || 0), 0);
-        NEXT_STEP.textContent = `Следующий маневр: ${step.maneuver.instruction} через ${formatDistance(dist)}`;
-        renderSteps(idx);
-        const speedKmh = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed * 3.6) : 0;
-        etaMinutes = estimateEtaWithTraffic(remainingDurationSec, speedKmh);
-        ROUTE_SUMMARY.textContent = `Навигация: ETA ${formatEtaMinutes(etaMinutes)} (с учетом пробок).`;
-        showNavCard(
-          formatDistance(dist),
-          step.maneuver.instruction,
-          `ETA: ${formatEtaMinutes(etaMinutes)} • ${step.roadName || 'Следуй указанию'}`,
-          step.maneuver.arrow
-        );
-      }
-
       const speedKmh = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed * 3.6) : 0;
       SPEED_CHIP.textContent = `${Math.round(speedKmh)} км/ч`;
-
-      const offRouteDistance = nearestRouteDistanceMeters(current, routeGeoJson?.coordinates);
-      const rerouteCooldownMs = 12000;
-      const settings = getRouteSettings();
-      if (offRouteDistance > settings.rerouteThreshold && !rerouteInFlight && Date.now() - lastRerouteAt > rerouteCooldownMs) {
-        rerouteInFlight = true;
-        lastRerouteAt = Date.now();
-        startPoint = [...current];
-        ROUTE_SUMMARY.textContent = 'Перестраиваю маршрут...';
-        await buildRoute().catch(() => {
-          ROUTE_SUMMARY.textContent = 'Не удалось перестроить маршрут.';
-        });
-        rerouteInFlight = false;
-      }
-
-      map.easeTo({ center: current, duration: 350, zoom: Math.max(map.getZoom(), 14) });
+      gpsFix = {
+        speedMps: Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed) : 0,
+        headingDeg: Number.isFinite(pos.coords.heading) ? pos.coords.heading : userHeadingDeg,
+        ts: Date.now(),
+      };
     },
     (err) => {
       ROUTE_SUMMARY.textContent = `Ошибка GPS: ${err.message}`;
     },
-    { enableHighAccuracy: true, maximumAge: 2000, timeout: 9000 }
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 6000 }
   );
 
+  startTrackingLoop();
   ROUTE_SUMMARY.textContent = 'Ведение запущено.';
+  saveActiveTrip();
 }
 
 function stopGuidance() {
@@ -1298,7 +1644,12 @@ function stopGuidance() {
   NEXT_STEP.textContent = 'Следующий маневр: -';
   ROUTE_SUMMARY.textContent = 'Ведение остановлено.';
   etaMinutes = null;
+  gpsFix = null;
+  smoothLocation = null;
+  stopTrackingLoop();
+  speak('Навигация остановлена.', true);
   hideNavCard();
+  saveActiveTrip();
 }
 
 async function ensureStartByGps() {
@@ -1368,12 +1719,22 @@ function setupEvents() {
     );
   });
 
-  GLOBAL_SEARCH_BTN.addEventListener('click', () => searchPlaces().catch(() => renderSearchResults([])));
+  let searchTimer = null;
   GLOBAL_SEARCH_INPUT.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      GLOBAL_SEARCH_BTN.click();
+      searchPlaces().catch(() => renderSearchResults([]));
     }
+  });
+  GLOBAL_SEARCH_INPUT.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      if (GLOBAL_SEARCH_INPUT.value.trim().length < 2) {
+        renderSearchResults([]);
+        return;
+      }
+      searchPlaces().catch(() => renderSearchResults([]));
+    }, 260);
   });
 
   SEARCH_RESULTS.addEventListener('click', (e) => {
@@ -1427,6 +1788,23 @@ function setupEvents() {
     applyRouteCandidate(0);
     setSheet('nav');
     ROUTE_SUMMARY.textContent = `Продолжен маршрут из истории: ${formatDistance(h.distance)}.`;
+  });
+  THEME_SELECT.addEventListener('change', () => {
+    const mode = THEME_SELECT.value;
+    localStorage.setItem(THEME_KEY, mode);
+    applyTheme(mode);
+  });
+  VOICE_ENABLED_TOGGLE.addEventListener('change', saveVoiceSettings);
+  VOICE_RATE.addEventListener('change', saveVoiceSettings);
+  VOICE_VOLUME.addEventListener('change', saveVoiceSettings);
+  VOICE_SELECT.addEventListener('change', saveVoiceSettings);
+  VOICE_TEST_BTN.addEventListener('click', () => {
+    saveVoiceSettings();
+    speak('Проверка голосовых подсказок. Через двести метров поверните направо.', true);
+  });
+  VOICE_PACK_BTN.addEventListener('click', () => {
+    saveVoiceSettings();
+    warmupVoicePack();
   });
 
   SET_START_GPS_BTN.addEventListener('click', () => {
@@ -1613,6 +1991,8 @@ async function init() {
   loadUserSettings();
   loadRouteSettings();
   loadRouteHistory();
+  loadTheme();
+  loadVoiceSettings();
   updateNetworkStatus();
   setupEvents();
   setupServiceWorker();
@@ -1627,7 +2007,31 @@ async function init() {
     renderRouteHistory();
     sourceTileTemplates = await resolveVectorTileTemplates();
     DOWNLOAD_STATUS.textContent = sourceTileTemplates.length ? 'Готово к загрузке области.' : 'Не найдены шаблоны векторных тайлов.';
+
+    const trip = loadActiveTrip();
+    if (trip) {
+      startPoint = trip.startPoint || null;
+      endPoint = trip.endPoint || null;
+      routeCandidates = trip.routeCandidates || [];
+      updateMarkersLayer();
+      if (routeCandidates.length) {
+        applyRouteCandidate(clamp(Number(trip.activeRouteIndex) || 0, 0, routeCandidates.length - 1));
+        ROUTE_SUMMARY.textContent = 'Восстановлен последний маршрут.';
+      }
+      if (trip.guidanceActive && routeCandidates.length) {
+        startGuidance();
+      }
+    }
   });
+
+  if ('speechSynthesis' in window) {
+    refreshVoiceList();
+    window.speechSynthesis.onvoiceschanged = refreshVoiceList;
+    const readyAt = Number(localStorage.getItem(VOICE_PACK_KEY) || 0);
+    if (readyAt) {
+      VOICE_PACK_STATUS.textContent = `Пакет готов: ${new Date(readyAt).toLocaleString()}`;
+    }
+  }
 }
 
 init();
