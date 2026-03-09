@@ -48,6 +48,11 @@ const START_GUIDANCE_BTN = $('startGuidanceBtn');
 const STOP_GUIDANCE_BTN = $('stopGuidanceBtn');
 const ICON_UPLOAD_INPUT = $('iconUploadInput');
 const RESET_USER_ICON_BTN = $('resetUserIconBtn');
+const CAR_ICON_SIZE_INPUT = $('carIconSize');
+const CAR_HEADING_OFFSET_INPUT = $('carHeadingOffset');
+const GPS_JITTER_RADIUS_INPUT = $('gpsJitterRadius');
+const HEADING_DEADBAND_INPUT = $('headingDeadband');
+const FREEZE_WHEN_STILL_TOGGLE = $('freezeWhenStillToggle');
 const CUSTOM_LAT_INPUT = $('customLat');
 const CUSTOM_LON_INPUT = $('customLon');
 const APPLY_CUSTOM_POS_BTN = $('applyCustomPosBtn');
@@ -76,6 +81,7 @@ const REROUTE_THRESHOLD = $('rerouteThreshold');
 const MAP_STYLE_LIGHT_URL = 'https://tiles.openfreemap.org/styles/liberty';
 const MAP_STYLE_DARK_URL = 'https://tiles.openfreemap.org/styles/dark';
 const THEME_KEY = 'offlinely_theme';
+const USER_NAV_CALIB_KEY = 'offlinely_user_nav_calib';
 let currentMapTheme = null;
 let darkStyleCached = null;
 let lightStyleCached = null;
@@ -103,6 +109,8 @@ let userLocation = null;
 let userHeadingDeg = null;
 let gpsFix = null;
 let smoothLocation = null;
+let rawGpsPoint = null;
+let lastAcceptedGpsTs = 0;
 let trackingRaf = null;
 let lastFrameTs = 0;
 let orientationListening = false;
@@ -115,6 +123,13 @@ let userMarker = null;
 let spokenStepMarks = new Set();
 let lastSpokenStepIdx = -1;
 let speechVoices = [];
+let userNavCalib = {
+  carIconSize: 42,
+  carHeadingOffsetDeg: 0,
+  gpsJitterRadiusM: 10,
+  headingDeadbandDeg: 4,
+  freezeWhenStill: true,
+};
 const VOICE_KEY = 'offlinely_voice';
 const VOICE_PACK_KEY = 'offlinely_voice_pack_ready_at';
 const ACTIVE_TRIP_KEY = 'offlinely_active_trip';
@@ -744,6 +759,20 @@ function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
+function normalizeDeg(v) {
+  let x = v % 360;
+  if (x < 0) x += 360;
+  return x;
+}
+
+function shortestAngleDeltaDeg(fromDeg, toDeg) {
+  return ((toDeg - fromDeg + 540) % 360) - 180;
+}
+
+function angleLerpDeg(fromDeg, toDeg, t) {
+  return normalizeDeg(fromDeg + shortestAngleDeltaDeg(fromDeg, toDeg) * t);
+}
+
 function buildTileRequestsForBbox(bbox, minZoom, maxZoom, templates) {
   const [west, south, east, north] = bbox;
   const out = [];
@@ -967,16 +996,18 @@ function updateUserLayer() {
 }
 
 function applyUserMarkerStyle(el) {
+  const iconSize = clamp(Number(userNavCalib.carIconSize) || 42, 24, 96);
   if (userIconDataUrl) {
     el.style.backgroundImage = `url(${userIconDataUrl})`;
     el.style.backgroundSize = 'contain';
     el.style.backgroundRepeat = 'no-repeat';
     el.style.backgroundPosition = 'center';
-    el.style.width = '42px';
-    el.style.height = '42px';
+    el.style.width = `${iconSize}px`;
+    el.style.height = `${iconSize}px`;
     el.style.border = '0';
     el.style.borderRadius = '0';
     el.style.backgroundColor = 'transparent';
+    el.style.boxShadow = 'none';
   } else {
     el.style.backgroundImage = '';
     el.style.width = '16px';
@@ -1006,10 +1037,11 @@ function updateUserMarker() {
   // Keep car pointing to real heading on map, independent from camera rotation.
   marker.setRotationAlignment('map');
   marker.setPitchAlignment('map');
+  const headingOffset = clamp(Number(userNavCalib.carHeadingOffsetDeg) || 0, -180, 180);
   if (Number.isFinite(userHeadingDeg)) {
-    marker.setRotation(userHeadingDeg);
+    marker.setRotation(normalizeDeg(userHeadingDeg + headingOffset));
   } else if (gpsFix && Number.isFinite(gpsFix.headingDeg)) {
-    marker.setRotation(gpsFix.headingDeg);
+    marker.setRotation(normalizeDeg(gpsFix.headingDeg + headingOffset));
   }
   marker.setLngLat(current);
 }
@@ -1032,12 +1064,20 @@ async function enableOrientationTracking() {
   }
 
   const handler = (e) => {
-    const heading = extractHeadingFromEvent(e);
-    if (!Number.isFinite(heading)) return;
-    userHeadingDeg = heading;
+    const headingRaw = extractHeadingFromEvent(e);
+    if (!Number.isFinite(headingRaw)) return;
+    const heading = normalizeDeg(headingRaw);
+    const deadband = clamp(Number(userNavCalib.headingDeadbandDeg) || 4, 0, 25);
+    if (!Number.isFinite(userHeadingDeg)) {
+      userHeadingDeg = heading;
+    } else {
+      const delta = shortestAngleDeltaDeg(userHeadingDeg, heading);
+      if (Math.abs(delta) < deadband) return;
+      userHeadingDeg = angleLerpDeg(userHeadingDeg, heading, 0.3);
+    }
     updateUserMarker();
     if (guidanceWatchId !== null) {
-      map.easeTo({ bearing: heading, duration: 120 });
+      map.easeTo({ bearing: userHeadingDeg, duration: 120 });
     }
   };
   window.addEventListener('deviceorientationabsolute', handler, true);
@@ -1052,8 +1092,20 @@ function startLivePositionWatch() {
       const point = [pos.coords.longitude, pos.coords.latitude];
       const speedMps = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed) : 0;
       const speedKmh = speedMps * 3.6;
-      if (!manualPositionOverride) {
+      rawGpsPoint = point;
+      const accM = Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : 30;
+      const jitterM = clamp(Number(userNavCalib.gpsJitterRadiusM) || 10, 2, 60);
+      const freezeStill = userNavCalib.freezeWhenStill !== false;
+      let acceptPoint = true;
+      if (!manualPositionOverride && userLocation) {
+        const drift = haversineMeters(userLocation, point);
+        const stillBySpeed = speedMps < 0.8;
+        const stillByDrift = drift < Math.max(jitterM, accM * 0.7);
+        if (freezeStill && stillBySpeed && stillByDrift) acceptPoint = false;
+      }
+      if (!manualPositionOverride && acceptPoint) {
         userLocation = point;
+        lastAcceptedGpsTs = Date.now();
       }
       gpsFix = {
         speedMps,
@@ -1178,6 +1230,42 @@ function loadUserSettings() {
     userIconDataUrl = null;
     manualPositionOverride = null;
   }
+}
+
+function loadUserNavCalibration() {
+  try {
+    const raw = localStorage.getItem(USER_NAV_CALIB_KEY);
+    if (raw) {
+      const c = JSON.parse(raw);
+      userNavCalib = {
+        carIconSize: clamp(Number(c.carIconSize) || 42, 24, 96),
+        carHeadingOffsetDeg: clamp(Number(c.carHeadingOffsetDeg) || 0, -180, 180),
+        gpsJitterRadiusM: clamp(Number(c.gpsJitterRadiusM) || 10, 2, 60),
+        headingDeadbandDeg: clamp(Number(c.headingDeadbandDeg) || 4, 0, 25),
+        freezeWhenStill: c.freezeWhenStill !== false,
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  if (CAR_ICON_SIZE_INPUT) CAR_ICON_SIZE_INPUT.value = String(userNavCalib.carIconSize);
+  if (CAR_HEADING_OFFSET_INPUT) CAR_HEADING_OFFSET_INPUT.value = String(userNavCalib.carHeadingOffsetDeg);
+  if (GPS_JITTER_RADIUS_INPUT) GPS_JITTER_RADIUS_INPUT.value = String(userNavCalib.gpsJitterRadiusM);
+  if (HEADING_DEADBAND_INPUT) HEADING_DEADBAND_INPUT.value = String(userNavCalib.headingDeadbandDeg);
+  if (FREEZE_WHEN_STILL_TOGGLE) FREEZE_WHEN_STILL_TOGGLE.checked = userNavCalib.freezeWhenStill !== false;
+}
+
+function saveUserNavCalibration() {
+  userNavCalib = {
+    carIconSize: clamp(Number(CAR_ICON_SIZE_INPUT?.value) || 42, 24, 96),
+    carHeadingOffsetDeg: clamp(Number(CAR_HEADING_OFFSET_INPUT?.value) || 0, -180, 180),
+    gpsJitterRadiusM: clamp(Number(GPS_JITTER_RADIUS_INPUT?.value) || 10, 2, 60),
+    headingDeadbandDeg: clamp(Number(HEADING_DEADBAND_INPUT?.value) || 4, 0, 25),
+    freezeWhenStill: FREEZE_WHEN_STILL_TOGGLE?.checked !== false,
+  };
+  localStorage.setItem(USER_NAV_CALIB_KEY, JSON.stringify(userNavCalib));
+  updateUserMarker();
 }
 
 function saveUserIcon(dataUrl) {
@@ -1754,13 +1842,27 @@ function startGuidance() {
 
   guidanceWatchId = navigator.geolocation.watchPosition(
     async (pos) => {
-      if (!manualPositionOverride) {
-        userLocation = [pos.coords.longitude, pos.coords.latitude];
+      const point = [pos.coords.longitude, pos.coords.latitude];
+      const speedMps = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed) : 0;
+      const speedKmh = speedMps * 3.6;
+      rawGpsPoint = point;
+      const accM = Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : 30;
+      const jitterM = clamp(Number(userNavCalib.gpsJitterRadiusM) || 10, 2, 60);
+      const freezeStill = userNavCalib.freezeWhenStill !== false;
+      let acceptPoint = true;
+      if (!manualPositionOverride && userLocation) {
+        const drift = haversineMeters(userLocation, point);
+        const stillBySpeed = speedMps < 0.8;
+        const stillByDrift = drift < Math.max(jitterM, accM * 0.7);
+        if (freezeStill && stillBySpeed && stillByDrift) acceptPoint = false;
       }
-      const speedKmh = Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed * 3.6) : 0;
+      if (!manualPositionOverride && acceptPoint) {
+        userLocation = point;
+        lastAcceptedGpsTs = Date.now();
+      }
       SPEED_CHIP.textContent = `${Math.round(speedKmh)} км/ч`;
       gpsFix = {
-        speedMps: Number.isFinite(pos.coords.speed) ? Math.max(0, pos.coords.speed) : 0,
+        speedMps,
         headingDeg: Number.isFinite(pos.coords.heading) ? pos.coords.heading : userHeadingDeg,
         ts: Date.now(),
       };
@@ -1991,6 +2093,11 @@ function setupEvents() {
     ICON_UPLOAD_INPUT.value = '';
     saveUserIcon(null);
   });
+  CAR_ICON_SIZE_INPUT?.addEventListener('change', saveUserNavCalibration);
+  CAR_HEADING_OFFSET_INPUT?.addEventListener('change', saveUserNavCalibration);
+  GPS_JITTER_RADIUS_INPUT?.addEventListener('change', saveUserNavCalibration);
+  HEADING_DEADBAND_INPUT?.addEventListener('change', saveUserNavCalibration);
+  FREEZE_WHEN_STILL_TOGGLE?.addEventListener('change', saveUserNavCalibration);
 
   APPLY_CUSTOM_POS_BTN.addEventListener('click', () => {
     const lat = Number(CUSTOM_LAT_INPUT.value);
@@ -2158,6 +2265,7 @@ async function init() {
   hideNavCard();
   loadFavorites();
   loadUserSettings();
+  loadUserNavCalibration();
   loadRouteSettings();
   loadRouteHistory();
   loadTheme();

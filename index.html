@@ -147,6 +147,25 @@
             <input id="iconUploadInput" type="file" accept="image/png,image/webp,image/jpeg" />
             <button id="resetUserIconBtn" type="button" class="tonal">Сбросить иконку</button>
           </div>
+          <details class="panel-row compact-block" open>
+            <summary>Калибровка иконки машины</summary>
+            <div class="panel-row inline">
+              <label for="carIconSize">Размер (px)</label>
+              <input id="carIconSize" type="number" min="24" max="96" step="1" value="42" />
+              <label for="carHeadingOffset">Смещение направления (°)</label>
+              <input id="carHeadingOffset" type="number" min="-180" max="180" step="1" value="0" />
+            </div>
+            <div class="panel-row inline">
+              <label for="gpsJitterRadius">Антидребезг GPS (м)</label>
+              <input id="gpsJitterRadius" type="number" min="2" max="60" step="1" value="10" />
+              <label for="headingDeadband">Мертв. зона компаса (°)</label>
+              <input id="headingDeadband" type="number" min="0" max="25" step="1" value="4" />
+            </div>
+            <div class="panel-row checkbox">
+              <input id="freezeWhenStillToggle" type="checkbox" checked />
+              <label for="freezeWhenStillToggle">Замораживать позицию при стоянке</label>
+            </div>
+          </details>
           <details class="panel-row compact-block">
             <summary>Ручная позиция</summary>
             <div class="panel-row inline">
