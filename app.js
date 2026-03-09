@@ -73,8 +73,12 @@ const AVOID_CITIES_TOGGLE = $('avoidCitiesToggle');
 const ROUTE_VARIANTS_COUNT = $('routeVariantsCount');
 const REROUTE_THRESHOLD = $('rerouteThreshold');
 
-const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
+const MAP_STYLE_LIGHT_URL = 'https://tiles.openfreemap.org/styles/liberty';
+const MAP_STYLE_DARK_URL = 'https://tiles.openfreemap.org/styles/dark';
 const THEME_KEY = 'offlinely_theme';
+let currentMapTheme = null;
+let darkStyleCached = null;
+let lightStyleCached = null;
 
 let selectedPlace = null;
 let currentSearchResults = [];
@@ -116,7 +120,7 @@ const ACTIVE_TRIP_KEY = 'offlinely_active_trip';
 
 const map = new maplibregl.Map({
   container: 'map',
-  style: MAP_STYLE_URL,
+  style: MAP_STYLE_LIGHT_URL,
   center: [37.6176, 55.7558],
   zoom: 11,
   hash: true,
@@ -998,9 +1002,14 @@ function updateUserMarker() {
   if (!current) return;
   const marker = ensureUserMarker();
   applyUserMarkerStyle(marker.getElement());
-  // Keep car icon direction stable in viewport while map rotates with phone.
-  marker.setRotationAlignment('viewport');
-  marker.setRotation(0);
+  // Keep car pointing to real heading on map, independent from camera rotation.
+  marker.setRotationAlignment('map');
+  marker.setPitchAlignment('map');
+  if (Number.isFinite(userHeadingDeg)) {
+    marker.setRotation(userHeadingDeg);
+  } else if (gpsFix && Number.isFinite(gpsFix.headingDeg)) {
+    marker.setRotation(gpsFix.headingDeg);
+  }
   marker.setLngLat(current);
 }
 
@@ -1194,12 +1203,114 @@ function saveRouteSettings() {
   localStorage.setItem('offlinely_route_settings', JSON.stringify(getRouteSettings()));
 }
 
-function applyTheme(mode) {
-  if (mode === 'system') {
-    document.documentElement.removeAttribute('data-theme');
-    return;
+function localizeStyleToRussian(style) {
+  const patched = JSON.parse(JSON.stringify(style));
+  const layers = patched.layers || [];
+  for (const l of layers) {
+    if (l.type !== 'symbol') continue;
+    const textField = l.layout && l.layout['text-field'];
+    if (!textField) continue;
+    l.layout = l.layout || {};
+    l.layout['text-field'] = [
+      'coalesce',
+      ['get', 'name:ru'],
+      ['get', 'name_ru'],
+      ['get', 'name'],
+    ];
   }
-  document.documentElement.setAttribute('data-theme', mode);
+  return patched;
+}
+
+function patchDarkStyle(style) {
+  const patched = localizeStyleToRussian(style);
+  const layers = patched.layers || [];
+
+  const setPaint = (id, key, value) => {
+    const layer = layers.find((l) => l.id === id);
+    if (!layer) return;
+    layer.paint = layer.paint || {};
+    layer.paint[key] = value;
+  };
+  const setPaintWhere = (predicate, key, value) => {
+    layers.forEach((l) => {
+      if (!predicate(l)) return;
+      l.paint = l.paint || {};
+      l.paint[key] = value;
+    });
+  };
+
+  // Base tones (as requested)
+  setPaint('background', 'background-color', '#252a35');
+  setPaint('water', 'fill-color', '#0f2133');
+  setPaint('landuse_park', 'fill-color', '#2a3f33');
+  setPaint('building', 'fill-color', '#343b4a');
+  setPaint('building', 'fill-outline-color', '#46506a');
+  setPaint('building', 'fill-opacity', 0.72);
+  setPaint('highway_major_inner', 'line-color', '#6e7895');
+  setPaint('highway_major_inner', 'line-blur', 0.2);
+
+  // Fallbacks for style variants
+  setPaintWhere((l) => l.id === 'background', 'background-color', '#252a35');
+  setPaintWhere((l) => /water/i.test(l.id) && l.type === 'fill', 'fill-color', '#0f2133');
+  setPaintWhere((l) => /(landcover|land|earth|landuse)/i.test(l.id) && l.type === 'fill', 'fill-color', '#2b3140');
+  setPaintWhere((l) => /(residential|suburb|neighbourhood)/i.test(l.id) && l.type === 'fill', 'fill-color', '#30374a');
+  setPaintWhere((l) => /(wood|forest)/i.test(l.id) && l.type === 'fill', 'fill-color', '#2a3f33');
+  setPaintWhere((l) => /(park|landuse_park)/i.test(l.id) && l.type === 'fill', 'fill-color', '#2d4637');
+  setPaintWhere((l) => /building/i.test(l.id) && l.type === 'fill', 'fill-color', '#343b4a');
+  setPaintWhere((l) => /building/i.test(l.id) && l.type === 'fill', 'fill-outline-color', '#46506a');
+  setPaintWhere((l) => /building/i.test(l.id) && l.type === 'fill', 'fill-opacity', 0.72);
+  setPaintWhere((l) => /(highway_major_inner|road_major|major_road)/i.test(l.id) && l.type === 'line', 'line-color', '#6e7895');
+  setPaintWhere((l) => /highway|road/.test(l.id) && l.type === 'line', 'line-blur', 0.15);
+
+  // Text readability similar to reference
+  setPaintWhere((l) => l.type === 'symbol' && l.paint && 'text-color' in l.paint, 'text-color', '#d8dfea');
+  setPaintWhere((l) => l.type === 'symbol' && l.paint && 'text-halo-color' in l.paint, 'text-halo-color', '#252a35');
+  setPaintWhere((l) => l.type === 'symbol' && l.paint && 'text-halo-width' in l.paint, 'text-halo-width', 1.2);
+
+  return patched;
+}
+
+async function getPatchedLightStyle() {
+  if (lightStyleCached) return lightStyleCached;
+  const res = await fetch(MAP_STYLE_LIGHT_URL);
+  if (!res.ok) throw new Error('Failed to load light style');
+  const base = await res.json();
+  lightStyleCached = localizeStyleToRussian(base);
+  return lightStyleCached;
+}
+
+async function getPatchedDarkStyle() {
+  if (darkStyleCached) return darkStyleCached;
+  const res = await fetch(MAP_STYLE_DARK_URL);
+  if (!res.ok) throw new Error('Failed to load dark style');
+  const base = await res.json();
+  darkStyleCached = patchDarkStyle(base);
+  return darkStyleCached;
+}
+
+async function applyTheme(mode) {
+  const systemDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const effective = mode === 'system' ? (systemDark ? 'dark' : 'light') : mode;
+  if (mode === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', mode);
+
+  if (currentMapTheme === effective) return;
+  currentMapTheme = effective;
+  if (effective === 'dark') {
+    try {
+      const styled = await getPatchedDarkStyle();
+      map.setStyle(styled);
+    } catch {
+      map.setStyle(MAP_STYLE_DARK_URL);
+    }
+  } else {
+    try {
+      const styled = await getPatchedLightStyle();
+      map.setStyle(styled);
+    } catch {
+      map.setStyle(MAP_STYLE_LIGHT_URL);
+    }
+  }
 }
 
 function loadTheme() {
@@ -2019,20 +2130,42 @@ async function init() {
   updateNetworkStatus();
   setupEvents();
   setupServiceWorker();
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onSystemThemeChange = () => {
+      if ((localStorage.getItem(THEME_KEY) || 'system') === 'system') {
+        applyTheme('system');
+      }
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onSystemThemeChange);
+    else if (mq.addListener) mq.addListener(onSystemThemeChange);
+  }
   await requestPersistentStorage();
   await refreshStorageInfo();
 
-  map.on('load', async () => {
+  let tripRestored = false;
+  const restoreMapOverlays = () => {
     ensureNavLayers();
     updateFavoritesLayer();
     updateUserLayer();
     updateUserMarker();
+    updateMarkersLayer();
+    updateRouteLayer();
+  };
+
+  map.on('style.load', () => {
+    restoreMapOverlays();
+  });
+
+  map.on('load', async () => {
+    restoreMapOverlays();
     renderRouteHistory();
     sourceTileTemplates = await resolveVectorTileTemplates();
     DOWNLOAD_STATUS.textContent = sourceTileTemplates.length ? 'Готово к загрузке области.' : 'Не найдены шаблоны векторных тайлов.';
 
     const trip = loadActiveTrip();
-    if (trip) {
+    if (trip && !tripRestored) {
+      tripRestored = true;
       startPoint = trip.startPoint || null;
       endPoint = trip.endPoint || null;
       routeCandidates = trip.routeCandidates || [];
