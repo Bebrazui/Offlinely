@@ -1,24 +1,33 @@
 ﻿const COUNTRY_SEARCH = document.getElementById('countrySearch');
 const COUNTRY_LIST = document.getElementById('countryList');
 const STORAGE_INFO = document.getElementById('storageInfo');
+const QUALITY_PRESET = document.getElementById('qualityPreset');
 
 const SETTINGS_KEY = 'offlinely_country_downloads';
+const TILE_CACHE = 'offlinely-tiles-v2';
 
 const COUNTRIES = [
-  { code: 'kz', flag: '🇰🇿', name: 'Kazakhstan', sizeMb: 980, bbox: [46.5, 40.5, 87.5, 55.5] },
-  { code: 'ru', flag: '🇷🇺', name: 'Russia (Europe+Ural)', sizeMb: 1900, bbox: [20.0, 50.0, 75.0, 66.0] },
-  { code: 'ua', flag: '🇺🇦', name: 'Ukraine', sizeMb: 620, bbox: [22.0, 44.0, 41.0, 53.0] },
-  { code: 'tr', flag: '🇹🇷', name: 'Turkey', sizeMb: 780, bbox: [26.0, 35.5, 45.0, 42.5] },
-  { code: 'de', flag: '🇩🇪', name: 'Germany', sizeMb: 690, bbox: [5.5, 47.0, 15.5, 55.2] },
-  { code: 'fr', flag: '🇫🇷', name: 'France', sizeMb: 840, bbox: [-5.5, 42.0, 9.7, 51.5] },
-  { code: 'it', flag: '🇮🇹', name: 'Italy', sizeMb: 700, bbox: [6.5, 36.5, 18.8, 47.2] },
-  { code: 'es', flag: '🇪🇸', name: 'Spain', sizeMb: 760, bbox: [-9.6, 36.0, 3.5, 43.9] },
-  { code: 'us', flag: '🇺🇸', name: 'USA (CONUS)', sizeMb: 2400, bbox: [-125.0, 24.0, -66.0, 49.5] },
-  { code: 'ca', flag: '🇨🇦', name: 'Canada (South)', sizeMb: 1500, bbox: [-141.0, 42.0, -52.0, 63.0] },
+  { code: 'kz', flag: '🇰🇿', name: 'Казахстан', sizeMb: 980, bbox: [46.5, 40.5, 87.5, 55.5] },
+  { code: 'ru', flag: '🇷🇺', name: 'Россия (Европа + Урал)', sizeMb: 1900, bbox: [20.0, 50.0, 75.0, 66.0] },
+  { code: 'ua', flag: '🇺🇦', name: 'Украина', sizeMb: 620, bbox: [22.0, 44.0, 41.0, 53.0] },
+  { code: 'tr', flag: '🇹🇷', name: 'Турция', sizeMb: 780, bbox: [26.0, 35.5, 45.0, 42.5] },
+  { code: 'de', flag: '🇩🇪', name: 'Германия', sizeMb: 690, bbox: [5.5, 47.0, 15.5, 55.2] },
+  { code: 'fr', flag: '🇫🇷', name: 'Франция', sizeMb: 840, bbox: [-5.5, 42.0, 9.7, 51.5] },
+  { code: 'it', flag: '🇮🇹', name: 'Италия', sizeMb: 700, bbox: [6.5, 36.5, 18.8, 47.2] },
+  { code: 'es', flag: '🇪🇸', name: 'Испания', sizeMb: 760, bbox: [-9.6, 36.0, 3.5, 43.9] },
+  { code: 'us', flag: '🇺🇸', name: 'США (континентальная часть)', sizeMb: 2400, bbox: [-125.0, 24.0, -66.0, 49.5] },
+  { code: 'ca', flag: '🇨🇦', name: 'Канада (юг)', sizeMb: 1500, bbox: [-141.0, 42.0, -52.0, 63.0] },
 ];
+
+const QUALITY_PRESETS = {
+  base: { minZoom: 6, maxZoom: 9, avgKb: 28 },
+  roads: { minZoom: 6, maxZoom: 11, avgKb: 40 },
+  detailed: { minZoom: 6, maxZoom: 12, avgKb: 52 },
+};
 
 let downloads = loadDownloads();
 let tileTemplates = [];
+let styleAssetUrls = [];
 let activeJobs = new Map();
 
 function loadDownloads() {
@@ -112,6 +121,19 @@ async function resolveTileTemplates() {
       }
     }
   }
+  const assets = [];
+  if (typeof style.sprite === 'string') {
+    assets.push(`${style.sprite}.json`, `${style.sprite}.png`, `${style.sprite}@2x.json`, `${style.sprite}@2x.png`);
+  }
+  if (typeof style.glyphs === 'string') {
+    const base = style.glyphs;
+    const ranges = ['0-255', '256-511', '512-767', '768-1023', '1024-1279', '1280-1535'];
+    for (const r of ranges) {
+      assets.push(base.replace('{fontstack}', 'Noto Sans Regular').replace('{range}', r));
+      assets.push(base.replace('{fontstack}', 'Noto Sans Bold').replace('{range}', r));
+    }
+  }
+  styleAssetUrls = Array.from(new Set(assets));
   return Array.from(new Set(templates));
 }
 
@@ -128,7 +150,8 @@ async function downloadCountry(country, progressEl, buttonEl) {
     return;
   }
 
-  const urls = buildTileUrls(country.bbox, 5, 8);
+  const preset = QUALITY_PRESETS[QUALITY_PRESET.value] || QUALITY_PRESETS.roads;
+  const urls = [...buildTileUrls(country.bbox, preset.minZoom, preset.maxZoom), ...styleAssetUrls];
   if (!urls.length) {
     progressEl.textContent = 'Нет тайлов для скачивания.';
     return;
@@ -143,13 +166,19 @@ async function downloadCountry(country, progressEl, buttonEl) {
     const total = urls.length;
     const queue = urls.slice();
     const concurrency = 8;
+    const cache = await caches.open(TILE_CACHE);
 
     async function worker() {
       while (queue.length) {
         const url = queue.pop();
         if (!url) break;
-        await fetch(url, { mode: 'cors', signal: controller.signal });
-        await postToSw({ type: 'CACHE_URL', url });
+        const req = new Request(url, { mode: 'cors' });
+        const cached = await cache.match(req);
+        if (!cached) {
+          const res = await fetch(req, { signal: controller.signal });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          await cache.put(req, res.clone());
+        }
         done += 1;
         if (done % 20 === 0 || done === total) {
           progressEl.textContent = `Скачивание: ${done}/${total}`;
@@ -158,9 +187,9 @@ async function downloadCountry(country, progressEl, buttonEl) {
     }
 
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    downloads[country.code] = { downloaded: true, at: Date.now(), urls };
+    downloads[country.code] = { downloaded: true, at: Date.now(), urls, preset: QUALITY_PRESET.value };
     saveDownloads();
-    progressEl.textContent = `Готово (${total} тайлов).`;
+    progressEl.textContent = `Готово (${total} файлов, z${preset.minZoom}-${preset.maxZoom}).`;
   } catch (e) {
     progressEl.textContent = e.name === 'AbortError' ? 'Остановлено.' : `Ошибка: ${e.message}`;
   } finally {
@@ -190,12 +219,15 @@ function render() {
   COUNTRY_LIST.innerHTML = '';
   for (const c of items) {
     const state = downloads[c.code];
+    const preset = QUALITY_PRESETS[QUALITY_PRESET.value] || QUALITY_PRESETS.roads;
+    const estimatedTiles = buildTileUrls(c.bbox, preset.minZoom, preset.maxZoom).length;
+    const estimatedGb = (estimatedTiles * preset.avgKb) / 1024 / 1024;
     const card = document.createElement('article');
     card.className = 'card';
 
     const title = document.createElement('div');
     title.className = 'row';
-    title.innerHTML = `<div><div class="name">${c.flag} ${c.name}</div><div class="meta">Размер: ~${c.sizeMb} MB</div></div><div class="meta">${state?.downloaded ? 'Скачано' : 'Не скачано'}</div>`;
+    title.innerHTML = `<div><div class="name">${c.flag} ${c.name}</div><div class="meta">Оценка: ~${estimatedGb.toFixed(2)} GB (${estimatedTiles} тайлов, z${preset.minZoom}-${preset.maxZoom})</div></div><div class="meta">${state?.downloaded ? `Скачано (${state.preset || 'base'})` : 'Не скачано'}</div>`;
 
     const actions = document.createElement('div');
     actions.className = 'actions';
@@ -227,6 +259,7 @@ function render() {
 
 async function init() {
   COUNTRY_SEARCH.addEventListener('input', render);
+  QUALITY_PRESET.addEventListener('change', render);
   if ('serviceWorker' in navigator) {
     await navigator.serviceWorker.register('./sw.js');
     await navigator.serviceWorker.ready;

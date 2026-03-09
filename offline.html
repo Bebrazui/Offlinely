@@ -16,6 +16,14 @@
 
     <section class="search-box">
       <input id="countrySearch" type="text" placeholder="Поиск страны" autocomplete="off" />
+      <div class="quality">
+        <label for="qualityPreset">Качество оффлайн-карты</label>
+        <select id="qualityPreset">
+          <option value="base">Базовое (города и трассы)</option>
+          <option value="roads" selected>Дороги (рекомендовано)</option>
+          <option value="detailed">Детально (очень много места)</option>
+        </select>
+      </div>
       <div id="storageInfo" class="storage">Проверка хранилища...</div>
     </section>
 
