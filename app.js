@@ -1964,15 +1964,38 @@ function setupEvents() {
 
 function setupServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
+  let refreshing = false;
 
   navigator.serviceWorker.addEventListener('message', (event) => {
     const msg = event.data;
     if (msg?.type === 'SETTINGS') AUTO_CACHE_TOGGLE.checked = Boolean(msg.autoCacheEnabled);
   });
 
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    window.location.reload();
+  });
+
   window.addEventListener('load', async () => {
     try {
-      await navigator.serviceWorker.register('./sw.js');
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      await reg.update();
+
+      if (reg.waiting) {
+        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      }
+
+      reg.addEventListener('updatefound', () => {
+        const installing = reg.installing;
+        if (!installing) return;
+        installing.addEventListener('statechange', () => {
+          if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+            installing.postMessage({ type: 'SKIP_WAITING' });
+          }
+        });
+      });
+
       await navigator.serviceWorker.ready;
       await postToSw({ type: 'GET_SETTINGS' });
     } catch (error) {

@@ -1,4 +1,4 @@
-﻿const STATIC_CACHE = 'offlinely-static-v2';
+﻿const STATIC_CACHE = 'offlinely-static-v3';
 const TILE_CACHE = 'offlinely-tiles-v2';
 const SETTINGS_DB = 'offlinely-settings';
 const SETTINGS_STORE = 'kv';
@@ -82,6 +82,11 @@ self.addEventListener('message', (event) => {
   const msg = event.data;
   if (!msg || typeof msg !== 'object') return;
 
+  if (msg.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+    return;
+  }
+
   if (msg.type === 'SET_AUTO_CACHE') {
     autoCacheEnabled = Boolean(msg.enabled);
     event.waitUntil(setSetting(AUTO_CACHE_KEY, autoCacheEnabled));
@@ -163,3 +168,4 @@ self.addEventListener('fetch', (event) => {
     }
   })());
 });
+
