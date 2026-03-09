@@ -1,4 +1,4 @@
-﻿const STATIC_CACHE = 'offlinely-static-v3';
+﻿const STATIC_CACHE = 'offlinely-static-v4';
 const TILE_CACHE = 'offlinely-tiles-v2';
 const SETTINGS_DB = 'offlinely-settings';
 const SETTINGS_STORE = 'kv';
@@ -135,14 +135,14 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
   if (url.origin === self.location.origin) {
     event.respondWith((async () => {
-      const cached = await caches.match(req);
-      if (cached) return cached;
       try {
         const fresh = await fetch(req);
         const staticCache = await caches.open(STATIC_CACHE);
         staticCache.put(req, fresh.clone());
         return fresh;
       } catch {
+        const cached = await caches.match(req);
+        if (cached) return cached;
         return caches.match('./index.html');
       }
     })());
@@ -168,4 +168,5 @@ self.addEventListener('fetch', (event) => {
     }
   })());
 });
+
 

@@ -25,6 +25,11 @@ const QUALITY_PRESETS = {
   detailed: { minZoom: 6, maxZoom: 12, avgKb: 52 },
 };
 
+function getSelectedQuality() {
+  const key = QUALITY_PRESET?.value || 'roads';
+  return QUALITY_PRESETS[key] || QUALITY_PRESETS.roads;
+}
+
 let downloads = loadDownloads();
 let tileTemplates = [];
 let styleAssetUrls = [];
@@ -150,7 +155,7 @@ async function downloadCountry(country, progressEl, buttonEl) {
     return;
   }
 
-  const preset = QUALITY_PRESETS[QUALITY_PRESET.value] || QUALITY_PRESETS.roads;
+  const preset = getSelectedQuality();
   const urls = [...buildTileUrls(country.bbox, preset.minZoom, preset.maxZoom), ...styleAssetUrls];
   if (!urls.length) {
     progressEl.textContent = 'Нет тайлов для скачивания.';
@@ -187,7 +192,7 @@ async function downloadCountry(country, progressEl, buttonEl) {
     }
 
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    downloads[country.code] = { downloaded: true, at: Date.now(), urls, preset: QUALITY_PRESET.value };
+    downloads[country.code] = { downloaded: true, at: Date.now(), urls, preset: QUALITY_PRESET?.value || 'roads' };
     saveDownloads();
     progressEl.textContent = `Готово (${total} файлов, z${preset.minZoom}-${preset.maxZoom}).`;
   } catch (e) {
@@ -219,7 +224,7 @@ function render() {
   COUNTRY_LIST.innerHTML = '';
   for (const c of items) {
     const state = downloads[c.code];
-    const preset = QUALITY_PRESETS[QUALITY_PRESET.value] || QUALITY_PRESETS.roads;
+    const preset = getSelectedQuality();
     const estimatedTiles = buildTileUrls(c.bbox, preset.minZoom, preset.maxZoom).length;
     const estimatedGb = (estimatedTiles * preset.avgKb) / 1024 / 1024;
     const card = document.createElement('article');
@@ -259,7 +264,7 @@ function render() {
 
 async function init() {
   COUNTRY_SEARCH.addEventListener('input', render);
-  QUALITY_PRESET.addEventListener('change', render);
+  QUALITY_PRESET?.addEventListener('change', render);
   if ('serviceWorker' in navigator) {
     await navigator.serviceWorker.register('./sw.js');
     await navigator.serviceWorker.ready;
