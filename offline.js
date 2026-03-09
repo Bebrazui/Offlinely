@@ -142,6 +142,16 @@ async function resolveTileTemplates() {
   return Array.from(new Set(templates));
 }
 
+async function requestPersistentStorage() {
+  try {
+    if (navigator.storage?.persist) {
+      await navigator.storage.persist();
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function postToSw(msg) {
   if (!('serviceWorker' in navigator)) return;
   const reg = await navigator.serviceWorker.ready;
@@ -168,6 +178,8 @@ async function downloadCountry(country, progressEl, buttonEl) {
 
   try {
     let done = 0;
+    let cachedCount = 0;
+    let failedCount = 0;
     const total = urls.length;
     const queue = urls.slice();
     const concurrency = 8;
@@ -177,24 +189,35 @@ async function downloadCountry(country, progressEl, buttonEl) {
       while (queue.length) {
         const url = queue.pop();
         if (!url) break;
-        const req = new Request(url, { mode: 'cors' });
-        const cached = await cache.match(req);
-        if (!cached) {
-          const res = await fetch(req, { signal: controller.signal });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          await cache.put(req, res.clone());
+        try {
+          const req = new Request(url, { mode: 'cors' });
+          const cached = await cache.match(req);
+          if (cached) {
+            cachedCount += 1;
+          } else {
+            const res = await fetch(req, { signal: controller.signal });
+            if (res.ok || res.type === 'opaque') {
+              await cache.put(req, res.clone());
+              cachedCount += 1;
+            } else {
+              failedCount += 1;
+            }
+          }
+        } catch {
+          failedCount += 1;
         }
         done += 1;
         if (done % 20 === 0 || done === total) {
-          progressEl.textContent = `Скачивание: ${done}/${total}`;
+          progressEl.textContent = `Скачивание: ${done}/${total} • В кэше: ${cachedCount} • Ошибок: ${failedCount}`;
         }
+        if (done % 120 === 0) await new Promise((r) => setTimeout(r, 0));
       }
     }
 
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
     downloads[country.code] = { downloaded: true, at: Date.now(), urls, preset: QUALITY_PRESET?.value || 'roads' };
     saveDownloads();
-    progressEl.textContent = `Готово (${total} файлов, z${preset.minZoom}-${preset.maxZoom}).`;
+    progressEl.textContent = `Готово: ${cachedCount}/${total} (ошибок: ${failedCount}), z${preset.minZoom}-${preset.maxZoom}.`;
   } catch (e) {
     progressEl.textContent = e.name === 'AbortError' ? 'Остановлено.' : `Ошибка: ${e.message}`;
   } finally {
@@ -265,6 +288,7 @@ function render() {
 async function init() {
   COUNTRY_SEARCH.addEventListener('input', render);
   QUALITY_PRESET?.addEventListener('change', render);
+  await requestPersistentStorage();
   if ('serviceWorker' in navigator) {
     await navigator.serviceWorker.register('./sw.js');
     await navigator.serviceWorker.ready;
